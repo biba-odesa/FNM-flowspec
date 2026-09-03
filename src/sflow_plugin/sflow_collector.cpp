@@ -105,10 +105,6 @@ std::string sflow_invalid_raw_packet_header_desc =
     "Number of raw packet header records with header size which does not fit into received data";
 uint64_t sflow_invalid_raw_packet_header = 0;
 
-std::string sflow_invalid_raw_packet_header_desc =
-    "Number of raw packet header records with header size which does not fit into received data";
-+uint64_t sflow_invalid_raw_packet_header = 0;
-
 std::vector<system_counter_t> get_sflow_stats() {
     std::vector<system_counter_t> counters;
 
