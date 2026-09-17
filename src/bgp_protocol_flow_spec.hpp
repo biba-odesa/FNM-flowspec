@@ -760,6 +760,7 @@ static_assert(sizeof(bgp_flow_spec_bitmask_operator_byte_t) == 1, "Bad size for 
 static_assert(sizeof(bgp_flow_spec_operator_byte_t) == 1, "Bad size for bgp_flow_spec_operator_byte_t");
 
 std::vector<dynamic_binary_buffer_t> build_attributes_for_flowspec_announce(flow_spec_rule_t flow_spec_rule);
+std::vector<dynamic_binary_buffer_t> build_attributes_for_gobgp_flowspec_announce(const flow_spec_rule_t& flow_spec_rule);
 bool encode_bgp_flow_spec_elements_into_bgp_mp_attribute(const flow_spec_rule_t& flow_spec_rule,
                                                          dynamic_binary_buffer_t& bgp_mp_ext_flow_spec_header_as_binary_array,
                                                          bool add_preamble);

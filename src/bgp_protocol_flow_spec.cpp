@@ -285,6 +285,35 @@ std::vector<dynamic_binary_buffer_t> build_attributes_for_flowspec_announce(flow
                                                  extended_attributes_as_binary_array };
 }
 
+// Build input attributes for GoBGP Path.pattrs_binary when the FlowSpec NLRI is supplied separately.
+std::vector<dynamic_binary_buffer_t> build_attributes_for_gobgp_flowspec_announce(const flow_spec_rule_t& flow_spec_rule) {
+    if (flow_spec_rule.ipv4_nexthops.size() != 1) {
+        logger << log4cpp::Priority::WARN << "GoBGP FlowSpec IPv4 redirect requires exactly one IPv4 next hop";
+        return std::vector<dynamic_binary_buffer_t>{};
+    }
+
+    bgp_attribute_origin origin_attr;
+    dynamic_binary_buffer_t origin_as_binary_array;
+    origin_as_binary_array.set_buffer_size_in_bytes(sizeof(origin_attr));
+    origin_as_binary_array.append_data_as_object_ptr(&origin_attr);
+
+    // GoBGP API requires NEXT_HOP as an input carrier and generates FlowSpec MP_REACH_NLRI itself.
+    bgp_attribute_next_hop_ipv4 next_hop_carrier_attr(0);
+    dynamic_binary_buffer_t next_hop_carrier_as_binary_array;
+    next_hop_carrier_as_binary_array.set_buffer_size_in_bytes(sizeof(next_hop_carrier_attr));
+    next_hop_carrier_as_binary_array.append_data_as_object_ptr(&next_hop_carrier_attr);
+
+    dynamic_binary_buffer_t redirect_extended_community_as_binary_array;
+    if (!encode_bgp_flow_spec_next_hop_as_extended_attribute(flow_spec_rule.ipv4_nexthops[0],
+                                                              redirect_extended_community_as_binary_array)) {
+        logger << log4cpp::Priority::WARN << "Cannot encode GoBGP FlowSpec IPv4 redirect extended community";
+        return std::vector<dynamic_binary_buffer_t>{};
+    }
+
+    return std::vector<dynamic_binary_buffer_t>{ origin_as_binary_array, next_hop_carrier_as_binary_array,
+                                                 redirect_extended_community_as_binary_array };
+}
+
 // Encode flow spec elements into MP NLRI
 bool encode_bgp_flow_spec_elements_as_mp_nlri(const flow_spec_rule_t& flow_spec_rule, dynamic_binary_buffer_t& mp_nlri_flow_spec) {
     mp_nlri_flow_spec.set_buffer_size_in_bytes(2048);

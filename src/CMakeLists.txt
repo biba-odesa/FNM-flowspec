@@ -1118,6 +1118,7 @@ endif()
 if (BUILD_TESTS) 
     add_executable(fastnetmon_tests fastnetmon_tests.cpp)
     target_link_libraries(fastnetmon_tests fast_library)
+    target_link_libraries(fastnetmon_tests bgp_protocol_flow_spec)
     target_link_libraries(fastnetmon_tests ${CMAKE_THREAD_LIBS_INIT})
     target_link_libraries(fastnetmon_tests ${Boost_LIBRARIES})
     target_link_libraries(fastnetmon_tests ${LOG4CPP_LIBRARY_PATH})
@@ -1189,7 +1190,10 @@ endif()
 
 install(TARGETS fastnetmon DESTINATION "${CMAKE_INSTALL_SBINDIR}")
 install(TARGETS fastnetmon_client DESTINATION "${CMAKE_INSTALL_BINDIR}")
-install(TARGETS fastnetmon_api_client DESTINATION "${CMAKE_INSTALL_BINDIR}")
+
+if (ENABLE_GOBGP_SUPPORT)
+    install(TARGETS fastnetmon_api_client DESTINATION "${CMAKE_INSTALL_BINDIR}")
+endif()
 
 install(FILES fastnetmon.conf DESTINATION "${CMAKE_INSTALL_SYSCONFDIR}")
 

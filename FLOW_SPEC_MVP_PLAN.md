@@ -20,7 +20,7 @@ Do not modify the original `fastnetmon-1.2.9` fork unless explicitly requested.
 The required architecture is:
 
 ```text
-FastNetMon
+FastNetMon CE
     |
     | gRPC
     v
@@ -32,7 +32,7 @@ Juniper MX480
     |
     | FlowSpec redirect
     v
-XDP scrubbing server
+later XDP scrubber
 ```
 
 IMPORTANT:
@@ -89,6 +89,21 @@ Do NOT change FastNetMon detection thresholds.
 
 Do NOT modify the existing packet detection pipeline.
 
+The FlowSpec MVP match is deliberately protocol-agnostic:
+
+```text
+destination IPv4 /32 + IP protocol + destination port
+    -> redirect-to-IPv4 Extended Community
+```
+
+At minimum, it supports TCP with a destination port and UDP with a destination port. Examples:
+
+```text
+victim /32 + TCP + dst-port 443 -> redirect IPv4
+victim /32 + UDP + dst-port 53  -> redirect IPv4
+victim /32 + UDP + dst-port 123 -> redirect IPv4
+```
+
 First prove that FastNetMon can:
 
 1. construct one static FlowSpec rule;
@@ -98,7 +113,7 @@ First prove that FastNetMon can:
 5. redirect only the matching traffic;
 6. remove the rule again.
 
-Only after this works should automatic `(protocol, destination port)` classification be implemented.
+TCP/443 below is only a deterministic wire-encoding test vector, not an architectural restriction. Only after this works should automatic `(protocol, destination port)` classification be implemented.
 
 ---
 
@@ -128,7 +143,7 @@ The FlowSpec rule must match ALL TCP traffic to destination port 443.
 
 It must NOT be limited to SYN packets.
 
-This is important because the eventual goal is mitigation of an attack against a specific service, not merely SYN packets.
+This is important because the eventual goal is mitigation of an attack against a specific service, not merely SYN packets. TCP flags are not part of the current MVP: do not add SYN matching or any other TCP-flag component. For UDP, TCP flags are inapplicable.
 
 ---
 
@@ -430,10 +445,10 @@ src/gobgp_client/gobgp_client.cpp:57
 
 The desired MVP should add a dedicated FlowSpec method instead of abusing the existing prefix announcement function.
 
-Suggested interface:
+Implemented interface:
 
 ```text
-GrpcClient::AddFlowSpecIPv4(...)
+GrpcClient::AnnounceFlowSpecIPv4(const flow_spec_rule_t&, std::string& add_path_uuid)
 ```
 
 and:
@@ -476,7 +491,7 @@ Important locations:
 src/gobgp_client/gobgp.proto:228
 ```
 
-The expected AddPath parameters for the MVP are:
+The implemented AddPath parameters for the MVP are:
 
 ```text
 table_type = GLOBAL
@@ -501,6 +516,8 @@ and required BGP attributes through:
 ```text
 Path.pattrs_binary
 ```
+
+The method accepts a ready `flow_spec_rule_t`; it does not assume TCP and is usable for both TCP and UDP FlowSpec rules. It adds exactly three raw input attributes separately: ORIGIN, the `0.0.0.0` NEXT_HOP API carrier, and EXTENDED_COMMUNITIES. It returns `AddPathResponse.uuid()` as an opaque binary `std::string`; no UUID storage exists yet.
 
 ---
 
@@ -826,7 +843,7 @@ Follow existing FastNetMon coding conventions.
 
 Do the work in this order.
 
-### Step 1 — Build static FlowSpec AddPath and unit-test exact wire encoding
+### Step 1 — Static wire encoding and unit-test — COMPLETE
 
 Reuse:
 
@@ -836,7 +853,7 @@ flow_spec_rule_t
 
 and existing component encoders.
 
-Expected logical rule:
+The deterministic test vector is:
 
 ```text
 dst 10.10.10.10/32
@@ -846,7 +863,35 @@ dst-port 443
 
 Use the resolved `pattrs_binary` set from section 17. Unit-test the exact FlowSpec NLRI, redirect Extended Community, and complete input attribute set before sending the static rule.
 
-### Step 2 — Add GoBGP FlowSpec AddPath method
+Implemented helper:
+
+```text
+build_attributes_for_gobgp_flowspec_announce()
+```
+
+The test `flowspec.gobgp_static_redirect_ipv4_wire_encoding` passed with:
+
+```text
+10.10.10.10/32 + TCP + dst-port 443 -> redirect 192.168.100.50
+```
+
+Verified NLRI:
+
+```text
+0d 01 20 0a 0a 0a 0a 03 81 06 05 91 01 bb
+```
+
+Verified raw input attributes:
+
+```text
+ORIGIN:               40 01 01 02
+NEXT_HOP carrier:     40 03 04 00 00 00 00
+EXTENDED_COMMUNITIES: c0 10 08 01 0c c0 a8 64 32 00 00
+```
+
+`MP_REACH_NLRI` is not passed through `pattrs_binary`.
+
+### Step 2 — GoBGP FlowSpec AddPath — COMPLETE
 
 Construct:
 
@@ -866,15 +911,35 @@ pattrs_binary
 
 Capture the returned UUID.
 
-### Step 3 — Add UUID deletion
-
-Use:
+Implemented as:
 
 ```text
-DeletePathRequest.uuid
+GrpcClient::AnnounceFlowSpecIPv4(const flow_spec_rule_t&, std::string& add_path_uuid)
 ```
 
-to withdraw the FlowSpec rule.
+It constructs a GLOBAL-table request with an empty VRF ID, AFI_IP, SAFI_FLOW_SPEC_UNICAST, raw `nlri_binary`, and the three separate input `pattrs_binary` values. `gobgp_client` successfully compiled with `ENABLE_GOBGP_SUPPORT=ON`, and the Step 1 FlowSpec unit-test passed again. The UUID is returned to the caller but is not stored yet.
+
+### Step 3 — UUID-based FlowSpec deletion — COMPLETE
+
+Implemented method:
+
+```text
+GrpcClient::WithdrawFlowSpecIPv4(const std::string& add_path_uuid)
+```
+
+It uses GoBGP `DeletePath` to withdraw the path created by `AnnounceFlowSpecIPv4()`. The `AddPathResponse.uuid()` value is passed unchanged as opaque binary bytes; it is not converted to text or hexadecimal and is not used to reconstruct an NLRI.
+
+The UUID-delete request contains only:
+
+```text
+table_type = GLOBAL
+vrf_id = ""
+uuid = add_path_uuid
+```
+
+It does not include `Family`, `Path`, NLRI, or path attributes. An empty UUID is rejected locally with an error before any RPC call. The method uses the existing gRPC deadline and error-logging style. The `gobgp_client` target compiled successfully after this change.
+
+UUID map/storage, ban/unban integration, automatic attack protocol/port classification, TCP flags, XDP scrubber logic, and automatic-classification configuration options remain out of scope.
 
 ### Step 4 — Connect to static test ban/unban
 
@@ -953,9 +1018,7 @@ Once that works, the detection/classification problem becomes a separate, much s
 
 ## 27. Current State
 
-Architecture analysis is complete enough to begin implementation.
-
-No production code changes have been made yet for this MVP.
+Architecture analysis is complete and Steps 1, 2, and 3 are complete at the implementation and compile/unit-test-check level.
 
 The current project already contains:
 
@@ -964,11 +1027,38 @@ The current project already contains:
 * FlowSpec component encoders
 * FlowSpec-related extended community structures
 
-The missing part is wiring these pieces together correctly for GoBGP `AddPath` / `DeletePath`.
+The GoBGP `AddPath` and UUID-based `DeletePath` client wiring are implemented and compiled. UUID state storage and the ban/unban integration are intentionally not implemented yet; the next architectural stage is the explicit static test-mode integration.
 
 The GoBGP v3.12.0 `pattrs_binary` requirements for FlowSpec AddPath are resolved in section 17.
 
-The next implementation step is a static FlowSpec `AddPath` plus unit tests for exact wire encoding.
+Build environment used for the successful checkpoint:
+
+```text
+Debian 13
+GCC 14.2
+CMake 3.31.6
+Protobuf 3.21.12
+system gRPC/Protobuf packages
+```
+
+Current changed source/test files:
+
+```text
+src/CMakeLists.txt
+src/bgp_protocol_flow_spec.cpp
+src/bgp_protocol_flow_spec.hpp
+src/fastnetmon_tests.cpp
+src/gobgp_client/gobgp_client.cpp
+src/gobgp_client/gobgp_client.hpp
+```
+
+Generated build artifacts are not source-commit inputs:
+
+```text
+build-step1/
+build-step2-gobgp/
+src/fast_platform.hpp
+```
 
 ---
 

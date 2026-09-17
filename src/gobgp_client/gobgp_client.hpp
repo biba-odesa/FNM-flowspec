@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 #include <grpc/grpc.h>
 #include <grpc++/channel.h>
 
@@ -42,10 +44,14 @@
 #pragma GCC diagnostic pop
 #endif // __GNUC__
 
+class flow_spec_rule_t;
 
 class GrpcClient {
     public:
     GrpcClient(std::shared_ptr<grpc::Channel> channel);
+
+    bool AnnounceFlowSpecIPv4(const flow_spec_rule_t& flow_spec_rule, std::string& add_path_uuid);
+    bool WithdrawFlowSpecIPv4(const std::string& add_path_uuid);
 
     // Announce unicast or flow spec
     bool AnnounceCommonPrefix(dynamic_binary_buffer_t binary_nlri,
@@ -59,5 +65,3 @@ class GrpcClient {
     private:
     std::unique_ptr<apipb::GobgpApi::Stub> stub_;
 };
-
-

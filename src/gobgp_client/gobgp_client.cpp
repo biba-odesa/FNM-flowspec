@@ -42,6 +42,7 @@
 
 #include "../all_logcpp_libraries.hpp"
 
+#include "../bgp_protocol_flow_spec.hpp"
 #include "../fast_library.hpp"
 
 unsigned int gobgp_client_connection_timeout = 5;
@@ -118,6 +119,98 @@ bool GrpcClient::AnnounceCommonPrefix(dynamic_binary_buffer_t binary_nlri,
         logger << log4cpp::Priority::ERROR << "AddPath request to BGP daemon failed with code: " << status.error_code()
                << " message " << status.error_message();
 
+        return false;
+    }
+
+    return true;
+}
+
+bool GrpcClient::AnnounceFlowSpecIPv4(const flow_spec_rule_t& flow_spec_rule, std::string& add_path_uuid) {
+    add_path_uuid.clear();
+
+    dynamic_binary_buffer_t binary_nlri;
+    if (!encode_bgp_flow_spec_elements_into_bgp_mp_attribute(flow_spec_rule, binary_nlri, false)) {
+        logger << log4cpp::Priority::ERROR << "Could not encode IPv4 FlowSpec NLRI";
+        return false;
+    }
+
+    if (binary_nlri.get_used_size() == 0 or binary_nlri.get_pointer() == NULL) {
+        logger << log4cpp::Priority::ERROR << "IPv4 FlowSpec NLRI is empty";
+        return false;
+    }
+
+    std::vector<dynamic_binary_buffer_t> bgp_attributes = build_attributes_for_gobgp_flowspec_announce(flow_spec_rule);
+
+    if (bgp_attributes.size() != 3) {
+        logger << log4cpp::Priority::ERROR << "GoBGP IPv4 FlowSpec announce requires exactly three path attributes";
+        return false;
+    }
+
+    for (const auto& bgp_attribute : bgp_attributes) {
+        if (bgp_attribute.get_used_size() == 0 or bgp_attribute.get_pointer() == NULL) {
+            logger << log4cpp::Priority::ERROR << "GoBGP IPv4 FlowSpec announce has an empty path attribute";
+            return false;
+        }
+    }
+
+    apipb::Path* current_path = new apipb::Path;
+    auto route_family = new apipb::Family;
+
+    route_family->set_afi(apipb::Family::AFI_IP);
+    route_family->set_safi(apipb::Family::SAFI_FLOW_SPEC_UNICAST);
+
+    current_path->set_allocated_family(route_family);
+    current_path->set_nlri_binary(binary_nlri.get_pointer(), binary_nlri.get_used_size());
+
+    for (const auto& bgp_attribute : bgp_attributes) {
+        current_path->add_pattrs_binary(bgp_attribute.get_pointer(), bgp_attribute.get_used_size());
+    }
+
+    apipb::AddPathRequest request;
+    request.set_table_type(apipb::TableType::GLOBAL);
+    request.set_vrf_id("");
+    request.set_allocated_path(current_path);
+
+    grpc::ClientContext context;
+    std::chrono::system_clock::time_point deadline =
+        std::chrono::system_clock::now() + std::chrono::seconds(gobgp_client_connection_timeout);
+    context.set_deadline(deadline);
+
+    apipb::AddPathResponse response;
+    auto status = stub_->AddPath(&context, request, &response);
+
+    if (!status.ok()) {
+        logger << log4cpp::Priority::ERROR << "AddPath request to BGP daemon failed with code: " << status.error_code()
+               << " message " << status.error_message();
+        return false;
+    }
+
+    add_path_uuid = response.uuid();
+    return true;
+}
+
+bool GrpcClient::WithdrawFlowSpecIPv4(const std::string& add_path_uuid) {
+    if (add_path_uuid.empty()) {
+        logger << log4cpp::Priority::ERROR << "Cannot withdraw IPv4 FlowSpec path with an empty AddPath UUID";
+        return false;
+    }
+
+    apipb::DeletePathRequest request;
+    request.set_table_type(apipb::TableType::GLOBAL);
+    request.set_vrf_id("");
+    request.set_uuid(add_path_uuid);
+
+    grpc::ClientContext context;
+    std::chrono::system_clock::time_point deadline =
+        std::chrono::system_clock::now() + std::chrono::seconds(gobgp_client_connection_timeout);
+    context.set_deadline(deadline);
+
+    google::protobuf::Empty response;
+    auto status = stub_->DeletePath(&context, request, &response);
+
+    if (!status.ok()) {
+        logger << log4cpp::Priority::ERROR << "DeletePath request to BGP daemon failed with code: " << status.error_code()
+               << " message " << status.error_message();
         return false;
     }
 
@@ -286,4 +379,3 @@ bool GrpcClient::AnnounceUnicastPrefixLowLevelIPv6(const IPv6UnicastAnnounce& un
     // Normally NLRI is empty for IPv6 announces but GoBGP uses pretty unusual approach to encode it described on top of this function
     return AnnounceCommonPrefix(ipv6_nlri, bgp_attributes, is_withdrawal, AFI_IP6, SAFI_UNICAST);
 }
-

@@ -1,8 +1,11 @@
 #include <gtest/gtest.h>
 #include <math.h>
 
+#include "bgp_protocol_flow_spec.hpp"
 #include "fast_library.hpp"
 
+#include <array>
+#include <cstring>
 #include <fstream>
 
 #include "log4cpp/Appender.hh"
@@ -18,6 +21,45 @@
 
 log4cpp::Category& logger = log4cpp::Category::getRoot();
 
+TEST(flowspec, gobgp_static_redirect_ipv4_wire_encoding) {
+    uint32_t destination_ip = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", destination_ip));
+
+    uint32_t redirect_next_hop = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("192.168.100.50", redirect_next_hop));
+
+    flow_spec_rule_t flow_spec_rule;
+    flow_spec_rule.set_destination_subnet_ipv4(subnet_cidr_mask_t(destination_ip, 32));
+    flow_spec_rule.add_protocol(ip_protocol_t::TCP);
+    flow_spec_rule.add_destination_port(443);
+    flow_spec_rule.add_ipv4_nexthop(redirect_next_hop);
+
+    dynamic_binary_buffer_t encoded_nlri;
+    ASSERT_TRUE(encode_bgp_flow_spec_elements_into_bgp_mp_attribute(flow_spec_rule, encoded_nlri, false));
+
+    const std::array<uint8_t, 14> expected_nlri = { 0x0d, 0x01, 0x20, 0x0a, 0x0a, 0x0a, 0x0a,
+                                                     0x03, 0x81, 0x06, 0x05, 0x91, 0x01, 0xbb };
+    ASSERT_EQ(encoded_nlri.get_used_size(), expected_nlri.size());
+    EXPECT_EQ(memcmp(encoded_nlri.get_pointer(), expected_nlri.data(), expected_nlri.size()), 0);
+
+    std::vector<dynamic_binary_buffer_t> attributes = build_attributes_for_gobgp_flowspec_announce(flow_spec_rule);
+    ASSERT_EQ(attributes.size(), 3U);
+
+    const std::array<uint8_t, 4> expected_origin = { 0x40, 0x01, 0x01, 0x02 };
+    const std::array<uint8_t, 7> expected_next_hop_carrier = { 0x40, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00 };
+    const std::array<uint8_t, 11> expected_redirect_extended_community = {
+        0xc0, 0x10, 0x08, 0x01, 0x0c, 0xc0, 0xa8, 0x64, 0x32, 0x00, 0x00
+    };
+
+    ASSERT_EQ(attributes[0].get_used_size(), expected_origin.size());
+    EXPECT_EQ(memcmp(attributes[0].get_pointer(), expected_origin.data(), expected_origin.size()), 0);
+    ASSERT_EQ(attributes[1].get_used_size(), expected_next_hop_carrier.size());
+    EXPECT_EQ(memcmp(attributes[1].get_pointer(), expected_next_hop_carrier.data(), expected_next_hop_carrier.size()), 0);
+    ASSERT_EQ(attributes[2].get_used_size(), expected_redirect_extended_community.size());
+    EXPECT_EQ(memcmp(attributes[2].get_pointer(), expected_redirect_extended_community.data(),
+                     expected_redirect_extended_community.size()),
+              0);
+}
 
 /* Patricia tests */
 
