@@ -60,6 +60,8 @@ class fastnetmon_configuration_t {
 
     // GoBGP
     bool gobgp{ false };
+    bool gobgp_flowspec{ false };
+    std::string gobgp_flowspec_redirect_ipv4{ "0.0.0.0" };
 
     // IPv4
     bool gobgp_announce_host{ false };
@@ -82,4 +84,3 @@ class fastnetmon_configuration_t {
     std::string gobgp_community_host_ipv6{ "65001:668" };
     std::string gobgp_community_subnet_ipv6{ "65001:667" };
 };
-

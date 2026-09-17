@@ -2,6 +2,7 @@
 #include <math.h>
 
 #include "bgp_protocol_flow_spec.hpp"
+#include "actions/gobgp_flowspec_rule_builder.hpp"
 #include "fast_library.hpp"
 
 #include <array>
@@ -135,6 +136,113 @@ TEST(flowspec, gobgp_static_redirect_ipv4_destination_only_wire_encoding) {
     EXPECT_EQ(memcmp(attributes[2].get_pointer(), expected_redirect_extended_community.data(),
                      expected_redirect_extended_community.size()),
               0);
+}
+
+TEST(gobgp_flowspec_rule_builder, tcp_protocol) {
+    uint32_t victim_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", victim_ipv4));
+
+    uint32_t redirect_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("192.168.100.50", redirect_ipv4));
+
+    attack_details_t current_attack;
+    current_attack.attack_protocol = static_cast<unsigned int>(ip_protocol_t::TCP);
+
+    flow_spec_rule_t flow_spec_rule = build_gobgp_flowspec_ipv4_rule(victim_ipv4, current_attack, redirect_ipv4);
+
+    EXPECT_TRUE(flow_spec_rule.destination_subnet_ipv4_used);
+    EXPECT_EQ(flow_spec_rule.destination_subnet_ipv4, subnet_cidr_mask_t(victim_ipv4, 32));
+    EXPECT_EQ(flow_spec_rule.protocols, std::vector<ip_protocol_t>{ ip_protocol_t::TCP });
+    EXPECT_TRUE(flow_spec_rule.destination_ports.empty());
+    EXPECT_TRUE(flow_spec_rule.tcp_flags.empty());
+    EXPECT_EQ(flow_spec_rule.ipv4_nexthops, std::vector<uint32_t>{ redirect_ipv4 });
+
+    dynamic_binary_buffer_t encoded_nlri;
+    ASSERT_TRUE(encode_bgp_flow_spec_elements_into_bgp_mp_attribute(flow_spec_rule, encoded_nlri, false));
+    const std::array<uint8_t, 10> expected_nlri = { 0x09, 0x01, 0x20, 0x0a, 0x0a,
+                                                     0x0a, 0x0a, 0x03, 0x81, 0x06 };
+    ASSERT_EQ(encoded_nlri.get_used_size(), expected_nlri.size());
+    EXPECT_EQ(memcmp(encoded_nlri.get_pointer(), expected_nlri.data(), expected_nlri.size()), 0);
+}
+
+TEST(gobgp_flowspec_rule_builder, udp_protocol) {
+    uint32_t victim_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", victim_ipv4));
+
+    uint32_t redirect_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("192.168.100.50", redirect_ipv4));
+
+    attack_details_t current_attack;
+    current_attack.attack_protocol = static_cast<unsigned int>(ip_protocol_t::UDP);
+
+    flow_spec_rule_t flow_spec_rule = build_gobgp_flowspec_ipv4_rule(victim_ipv4, current_attack, redirect_ipv4);
+
+    EXPECT_TRUE(flow_spec_rule.destination_subnet_ipv4_used);
+    EXPECT_EQ(flow_spec_rule.destination_subnet_ipv4, subnet_cidr_mask_t(victim_ipv4, 32));
+    EXPECT_EQ(flow_spec_rule.protocols, std::vector<ip_protocol_t>{ ip_protocol_t::UDP });
+    EXPECT_TRUE(flow_spec_rule.destination_ports.empty());
+    EXPECT_TRUE(flow_spec_rule.tcp_flags.empty());
+    EXPECT_EQ(flow_spec_rule.ipv4_nexthops, std::vector<uint32_t>{ redirect_ipv4 });
+
+    dynamic_binary_buffer_t encoded_nlri;
+    ASSERT_TRUE(encode_bgp_flow_spec_elements_into_bgp_mp_attribute(flow_spec_rule, encoded_nlri, false));
+    const std::array<uint8_t, 10> expected_nlri = { 0x09, 0x01, 0x20, 0x0a, 0x0a,
+                                                     0x0a, 0x0a, 0x03, 0x81, 0x11 };
+    ASSERT_EQ(encoded_nlri.get_used_size(), expected_nlri.size());
+    EXPECT_EQ(memcmp(encoded_nlri.get_pointer(), expected_nlri.data(), expected_nlri.size()), 0);
+}
+
+TEST(gobgp_flowspec_rule_builder, icmp_protocol) {
+    uint32_t victim_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", victim_ipv4));
+
+    uint32_t redirect_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("192.168.100.50", redirect_ipv4));
+
+    attack_details_t current_attack;
+    current_attack.attack_protocol = static_cast<unsigned int>(ip_protocol_t::ICMP);
+
+    flow_spec_rule_t flow_spec_rule = build_gobgp_flowspec_ipv4_rule(victim_ipv4, current_attack, redirect_ipv4);
+
+    EXPECT_TRUE(flow_spec_rule.destination_subnet_ipv4_used);
+    EXPECT_EQ(flow_spec_rule.destination_subnet_ipv4, subnet_cidr_mask_t(victim_ipv4, 32));
+    EXPECT_EQ(flow_spec_rule.protocols, std::vector<ip_protocol_t>{ ip_protocol_t::ICMP });
+    EXPECT_TRUE(flow_spec_rule.destination_ports.empty());
+    EXPECT_TRUE(flow_spec_rule.tcp_flags.empty());
+    EXPECT_EQ(flow_spec_rule.ipv4_nexthops, std::vector<uint32_t>{ redirect_ipv4 });
+
+    dynamic_binary_buffer_t encoded_nlri;
+    ASSERT_TRUE(encode_bgp_flow_spec_elements_into_bgp_mp_attribute(flow_spec_rule, encoded_nlri, false));
+    const std::array<uint8_t, 10> expected_nlri = { 0x09, 0x01, 0x20, 0x0a, 0x0a,
+                                                     0x0a, 0x0a, 0x03, 0x81, 0x01 };
+    ASSERT_EQ(encoded_nlri.get_used_size(), expected_nlri.size());
+    EXPECT_EQ(memcmp(encoded_nlri.get_pointer(), expected_nlri.data(), expected_nlri.size()), 0);
+}
+
+TEST(gobgp_flowspec_rule_builder, unsupported_protocol) {
+    uint32_t victim_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", victim_ipv4));
+
+    uint32_t redirect_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("192.168.100.50", redirect_ipv4));
+
+    attack_details_t current_attack;
+    current_attack.attack_protocol = 0;
+
+    flow_spec_rule_t flow_spec_rule = build_gobgp_flowspec_ipv4_rule(victim_ipv4, current_attack, redirect_ipv4);
+
+    EXPECT_TRUE(flow_spec_rule.destination_subnet_ipv4_used);
+    EXPECT_EQ(flow_spec_rule.destination_subnet_ipv4, subnet_cidr_mask_t(victim_ipv4, 32));
+    EXPECT_TRUE(flow_spec_rule.protocols.empty());
+    EXPECT_TRUE(flow_spec_rule.destination_ports.empty());
+    EXPECT_TRUE(flow_spec_rule.tcp_flags.empty());
+    EXPECT_EQ(flow_spec_rule.ipv4_nexthops, std::vector<uint32_t>{ redirect_ipv4 });
+
+    dynamic_binary_buffer_t encoded_nlri;
+    ASSERT_TRUE(encode_bgp_flow_spec_elements_into_bgp_mp_attribute(flow_spec_rule, encoded_nlri, false));
+    const std::array<uint8_t, 7> expected_nlri = { 0x06, 0x01, 0x20, 0x0a, 0x0a, 0x0a, 0x0a };
+    ASSERT_EQ(encoded_nlri.get_used_size(), expected_nlri.size());
+    EXPECT_EQ(memcmp(encoded_nlri.get_pointer(), expected_nlri.data(), expected_nlri.size()), 0);
 }
 
 /* Patricia tests */

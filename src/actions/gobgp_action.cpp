@@ -10,6 +10,8 @@
 
 #include "../fastnetmon_configuration_scheme.hpp"
 
+#include <cstdlib>
+
 extern fastnetmon_configuration_t fastnetmon_global_configuration;
 
 void gobgp_action_init() {
@@ -61,6 +63,22 @@ void gobgp_action_init() {
 
     if (configuration_map.count("gobgp_community_subnet_ipv6")) {
         fastnetmon_global_configuration.gobgp_community_subnet_ipv6 = configuration_map["gobgp_community_subnet_ipv6"];
+    }
+
+    if (configuration_map.count("gobgp_flowspec_redirect_ipv4")) {
+        fastnetmon_global_configuration.gobgp_flowspec_redirect_ipv4 = configuration_map["gobgp_flowspec_redirect_ipv4"];
+    }
+
+    if (fastnetmon_global_configuration.gobgp_flowspec) {
+        uint32_t redirect_ipv4 = 0;
+
+        if (!convert_ip_as_string_to_uint_safe(fastnetmon_global_configuration.gobgp_flowspec_redirect_ipv4, redirect_ipv4)
+            || redirect_ipv4 == 0) {
+            logger << log4cpp::Priority::ERROR
+                   << "Configuration error: gobgp_flowspec=on requires a non-zero valid IPv4 "
+                      "gobgp_flowspec_redirect_ipv4";
+            exit(1);
+        }
     }
 }
 

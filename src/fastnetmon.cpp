@@ -698,6 +698,15 @@ bool load_configuration_file() {
     if (configuration_map.count("gobgp") != 0) {
         fastnetmon_global_configuration.gobgp = configuration_map["gobgp"] == "on";
     }
+
+    if (configuration_map.count("gobgp_flowspec") != 0) {
+        fastnetmon_global_configuration.gobgp_flowspec = configuration_map["gobgp_flowspec"] == "on";
+    }
+
+    if (fastnetmon_global_configuration.gobgp_flowspec && !fastnetmon_global_configuration.gobgp) {
+        logger << log4cpp::Priority::ERROR << "Configuration error: gobgp_flowspec=on requires gobgp=on";
+        exit(1);
+    }
 #endif
 
     // ExaBGP configuration
