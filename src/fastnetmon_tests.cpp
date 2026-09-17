@@ -2,7 +2,9 @@
 #include <math.h>
 
 #include "bgp_protocol_flow_spec.hpp"
+#include "actions/gobgp_flowspec_lifecycle.hpp"
 #include "actions/gobgp_flowspec_rule_builder.hpp"
+#include "actions/gobgp_log_formatter.hpp"
 #include "fast_library.hpp"
 
 #include <array>
@@ -21,6 +23,222 @@
 #include <arpa/inet.h>
 
 log4cpp::Category& logger = log4cpp::Category::getRoot();
+
+namespace {
+
+flow_spec_rule_t make_gobgp_flowspec_lifecycle_rule(uint32_t destination_ipv4,
+                                                    ip_protocol_t protocol,
+                                                    bool include_protocol,
+                                                    bool include_destination_port = false) {
+    uint32_t redirect_ipv4 = 0;
+    convert_ip_as_string_to_uint_safe("192.168.100.50", redirect_ipv4);
+
+    flow_spec_rule_t flow_spec_rule;
+    flow_spec_rule.set_destination_subnet_ipv4(subnet_cidr_mask_t(destination_ipv4, 32));
+    flow_spec_rule.add_ipv4_nexthop(redirect_ipv4);
+
+    if (include_protocol) {
+        flow_spec_rule.add_protocol(protocol);
+    }
+
+    if (include_destination_port) {
+        flow_spec_rule.add_destination_port(443);
+    }
+
+    return flow_spec_rule;
+}
+
+gobgp_flowspec_rule_key_t make_gobgp_flowspec_lifecycle_key(const flow_spec_rule_t& flow_spec_rule) {
+    gobgp_flowspec_rule_key_t rule_key;
+    EXPECT_TRUE(build_gobgp_flowspec_rule_key(flow_spec_rule, rule_key));
+    return rule_key;
+}
+
+} // namespace
+
+TEST(gobgp_flowspec_lifecycle, first_ban_and_duplicate_ban) {
+    uint32_t destination_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", destination_ipv4));
+
+    flow_spec_rule_t flow_spec_rule = make_gobgp_flowspec_lifecycle_rule(destination_ipv4, ip_protocol_t::TCP, true);
+    gobgp_flowspec_rule_key_t rule_key = make_gobgp_flowspec_lifecycle_key(flow_spec_rule);
+    gobgp_flowspec_lifecycle_t lifecycle;
+
+    EXPECT_TRUE(lifecycle.begin_announce(rule_key, flow_spec_rule));
+    EXPECT_FALSE(lifecycle.begin_announce(rule_key, flow_spec_rule));
+    EXPECT_EQ(lifecycle.size(), 1U);
+}
+
+TEST(gobgp_flowspec_lifecycle, add_success_installs_uuid) {
+    uint32_t destination_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", destination_ipv4));
+
+    flow_spec_rule_t flow_spec_rule = make_gobgp_flowspec_lifecycle_rule(destination_ipv4, ip_protocol_t::UDP, true);
+    gobgp_flowspec_rule_key_t rule_key = make_gobgp_flowspec_lifecycle_key(flow_spec_rule);
+    gobgp_flowspec_lifecycle_t lifecycle;
+
+    ASSERT_TRUE(lifecycle.begin_announce(rule_key, flow_spec_rule));
+    EXPECT_EQ(lifecycle.complete_announce(rule_key, std::string("\x00\x01", 2)),
+              gobgp_flowspec_announce_completion_t::installed);
+
+    std::optional<gobgp_flowspec_rule_state_snapshot_t> state = lifecycle.get_state(rule_key);
+    ASSERT_TRUE(state.has_value());
+    EXPECT_EQ(state->state, gobgp_flowspec_rule_state_type_t::installed);
+    EXPECT_EQ(state->add_path_uuid, std::string("\x00\x01", 2));
+}
+
+TEST(gobgp_flowspec_lifecycle, unban_during_announce_requires_immediate_withdraw) {
+    uint32_t destination_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", destination_ipv4));
+
+    flow_spec_rule_t flow_spec_rule = make_gobgp_flowspec_lifecycle_rule(destination_ipv4, ip_protocol_t::ICMP, true);
+    gobgp_flowspec_rule_key_t rule_key = make_gobgp_flowspec_lifecycle_key(flow_spec_rule);
+    gobgp_flowspec_lifecycle_t lifecycle;
+
+    ASSERT_TRUE(lifecycle.begin_announce(rule_key, flow_spec_rule));
+    gobgp_flowspec_withdraw_start_result_t withdraw_start = lifecycle.begin_withdraw_for_victim(destination_ipv4);
+    EXPECT_TRUE(withdraw_start.withdraw_requests.empty());
+    ASSERT_EQ(withdraw_start.deferred_rules.size(), 1U);
+
+    EXPECT_EQ(lifecycle.complete_announce(rule_key, std::string("\x01\x02", 2)),
+              gobgp_flowspec_announce_completion_t::withdraw_required);
+
+    std::optional<gobgp_flowspec_rule_state_snapshot_t> state = lifecycle.get_state(rule_key);
+    ASSERT_TRUE(state.has_value());
+    EXPECT_EQ(state->state, gobgp_flowspec_rule_state_type_t::withdrawing);
+    EXPECT_EQ(state->add_path_uuid, std::string("\x01\x02", 2));
+}
+
+TEST(gobgp_flowspec_lifecycle, installed_unban_erases_only_after_successful_withdraw) {
+    uint32_t destination_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", destination_ipv4));
+
+    flow_spec_rule_t flow_spec_rule = make_gobgp_flowspec_lifecycle_rule(destination_ipv4, ip_protocol_t::TCP, true, true);
+    gobgp_flowspec_rule_key_t rule_key = make_gobgp_flowspec_lifecycle_key(flow_spec_rule);
+    gobgp_flowspec_lifecycle_t lifecycle;
+    const std::string add_path_uuid("\x10\x20", 2);
+
+    ASSERT_TRUE(lifecycle.begin_announce(rule_key, flow_spec_rule));
+    ASSERT_EQ(lifecycle.complete_announce(rule_key, add_path_uuid), gobgp_flowspec_announce_completion_t::installed);
+
+    gobgp_flowspec_withdraw_start_result_t withdraw_start = lifecycle.begin_withdraw_for_victim(destination_ipv4);
+    ASSERT_EQ(withdraw_start.withdraw_requests.size(), 1U);
+    EXPECT_EQ(withdraw_start.withdraw_requests.front().add_path_uuid, add_path_uuid);
+    EXPECT_EQ(lifecycle.complete_withdraw(rule_key, add_path_uuid, true), gobgp_flowspec_withdraw_completion_t::erased);
+    EXPECT_EQ(lifecycle.size(), 0U);
+}
+
+TEST(gobgp_flowspec_lifecycle, failed_withdraw_retains_uuid_for_retry) {
+    uint32_t destination_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", destination_ipv4));
+
+    flow_spec_rule_t flow_spec_rule = make_gobgp_flowspec_lifecycle_rule(destination_ipv4, ip_protocol_t::UDP, true);
+    gobgp_flowspec_rule_key_t rule_key = make_gobgp_flowspec_lifecycle_key(flow_spec_rule);
+    gobgp_flowspec_lifecycle_t lifecycle;
+    const std::string add_path_uuid("\x30\x40", 2);
+
+    ASSERT_TRUE(lifecycle.begin_announce(rule_key, flow_spec_rule));
+    ASSERT_EQ(lifecycle.complete_announce(rule_key, add_path_uuid), gobgp_flowspec_announce_completion_t::installed);
+    ASSERT_EQ(lifecycle.begin_withdraw_for_victim(destination_ipv4).withdraw_requests.size(), 1U);
+    EXPECT_EQ(lifecycle.complete_withdraw(rule_key, add_path_uuid, false), gobgp_flowspec_withdraw_completion_t::retry_pending);
+
+    std::optional<gobgp_flowspec_rule_state_snapshot_t> state = lifecycle.get_state(rule_key);
+    ASSERT_TRUE(state.has_value());
+    EXPECT_EQ(state->state, gobgp_flowspec_rule_state_type_t::withdraw_requested);
+    EXPECT_EQ(state->add_path_uuid, add_path_uuid);
+
+    gobgp_flowspec_withdraw_start_result_t retry_start = lifecycle.begin_withdraw_for_victim(destination_ipv4);
+    ASSERT_EQ(retry_start.withdraw_requests.size(), 1U);
+    EXPECT_EQ(retry_start.withdraw_requests.front().add_path_uuid, add_path_uuid);
+}
+
+TEST(gobgp_flowspec_lifecycle, multiple_rule_keys_for_one_victim_can_coexist) {
+    uint32_t destination_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", destination_ipv4));
+
+    flow_spec_rule_t tcp_rule = make_gobgp_flowspec_lifecycle_rule(destination_ipv4, ip_protocol_t::TCP, true, true);
+    flow_spec_rule_t udp_rule = make_gobgp_flowspec_lifecycle_rule(destination_ipv4, ip_protocol_t::UDP, true, true);
+    gobgp_flowspec_rule_key_t tcp_key = make_gobgp_flowspec_lifecycle_key(tcp_rule);
+    gobgp_flowspec_rule_key_t udp_key = make_gobgp_flowspec_lifecycle_key(udp_rule);
+    gobgp_flowspec_lifecycle_t lifecycle;
+
+    ASSERT_TRUE(lifecycle.begin_announce(tcp_key, tcp_rule));
+    ASSERT_TRUE(lifecycle.begin_announce(udp_key, udp_rule));
+    ASSERT_EQ(lifecycle.complete_announce(tcp_key, std::string("\x01", 1)), gobgp_flowspec_announce_completion_t::installed);
+    ASSERT_EQ(lifecycle.complete_announce(udp_key, std::string("\x02", 1)), gobgp_flowspec_announce_completion_t::installed);
+
+    gobgp_flowspec_withdraw_start_result_t withdraw_start = lifecycle.begin_withdraw_for_victim(destination_ipv4);
+    EXPECT_EQ(withdraw_start.withdraw_requests.size(), 2U);
+}
+
+TEST(gobgp_log_formatter, uuid_binary_hex_encoding) {
+    const std::string uuid = std::string("\x00\x01\x7f\x80\xff", 5);
+    EXPECT_EQ(format_gobgp_uuid_as_hex(uuid), "uuid=hex:00017f80ff");
+}
+
+TEST(gobgp_log_formatter, flowspec_tcp_without_destination_port) {
+    uint32_t destination_ip = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", destination_ip));
+
+    uint32_t redirect_next_hop = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("192.168.100.50", redirect_next_hop));
+
+    flow_spec_rule_t flow_spec_rule;
+    flow_spec_rule.set_destination_subnet_ipv4(subnet_cidr_mask_t(destination_ip, 32));
+    flow_spec_rule.add_protocol(ip_protocol_t::TCP);
+    flow_spec_rule.add_ipv4_nexthop(redirect_next_hop);
+
+    EXPECT_EQ(format_gobgp_flowspec_rule(flow_spec_rule),
+              "dst=10.10.10.10/32 protocol=TCP redirect=192.168.100.50");
+}
+
+TEST(gobgp_log_formatter, flowspec_tcp_with_destination_port) {
+    uint32_t destination_ip = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", destination_ip));
+
+    uint32_t redirect_next_hop = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("192.168.100.50", redirect_next_hop));
+
+    flow_spec_rule_t flow_spec_rule;
+    flow_spec_rule.set_destination_subnet_ipv4(subnet_cidr_mask_t(destination_ip, 32));
+    flow_spec_rule.add_protocol(ip_protocol_t::TCP);
+    flow_spec_rule.add_destination_port(443);
+    flow_spec_rule.add_ipv4_nexthop(redirect_next_hop);
+
+    EXPECT_EQ(format_gobgp_flowspec_rule(flow_spec_rule),
+              "dst=10.10.10.10/32 protocol=TCP dst_port=443 redirect=192.168.100.50");
+}
+
+TEST(gobgp_log_formatter, flowspec_icmp_without_destination_port) {
+    uint32_t destination_ip = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", destination_ip));
+
+    uint32_t redirect_next_hop = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("192.168.100.50", redirect_next_hop));
+
+    flow_spec_rule_t flow_spec_rule;
+    flow_spec_rule.set_destination_subnet_ipv4(subnet_cidr_mask_t(destination_ip, 32));
+    flow_spec_rule.add_protocol(ip_protocol_t::ICMP);
+    flow_spec_rule.add_ipv4_nexthop(redirect_next_hop);
+
+    EXPECT_EQ(format_gobgp_flowspec_rule(flow_spec_rule),
+              "dst=10.10.10.10/32 protocol=ICMP redirect=192.168.100.50");
+}
+
+TEST(gobgp_log_formatter, flowspec_destination_only) {
+    uint32_t destination_ip = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", destination_ip));
+
+    uint32_t redirect_next_hop = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("192.168.100.50", redirect_next_hop));
+
+    flow_spec_rule_t flow_spec_rule;
+    flow_spec_rule.set_destination_subnet_ipv4(subnet_cidr_mask_t(destination_ip, 32));
+    flow_spec_rule.add_ipv4_nexthop(redirect_next_hop);
+
+    EXPECT_EQ(format_gobgp_flowspec_rule(flow_spec_rule),
+              "dst=10.10.10.10/32 protocol=ANY redirect=192.168.100.50");
+}
 
 TEST(flowspec, gobgp_static_redirect_ipv4_wire_encoding) {
     uint32_t destination_ip = 0;

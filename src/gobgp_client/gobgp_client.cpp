@@ -218,9 +218,6 @@ bool GrpcClient::WithdrawFlowSpecIPv4(const std::string& add_path_uuid) {
 }
 
 bool GrpcClient::AnnounceUnicastPrefixLowLevelIPv4(const IPv4UnicastAnnounce& unicast_ipv4_announce, bool is_withdrawal) {
-    logger << log4cpp::Priority::INFO << "Send IPv4 " << (is_withdrawal ? "withdrawal " : "")
-           << "unicast announce to BGP daemon: " << unicast_ipv4_announce.print();
-
     dynamic_binary_buffer_t binary_nlri;
     auto binary_nlri_generation_result = unicast_ipv4_announce.generate_nlri(binary_nlri);
 
@@ -254,9 +251,6 @@ bool GrpcClient::AnnounceUnicastPrefixLowLevelIPv4(const IPv4UnicastAnnounce& un
 
 
 bool GrpcClient::AnnounceUnicastPrefixLowLevelIPv6(const IPv6UnicastAnnounce& unicast_ipv6_announce, bool is_withdrawal) {
-    logger << log4cpp::Priority::INFO << "Send IPv6 " << (is_withdrawal ? "withdrawal " : "")
-           << "unicast announce to BGP daemon: " << unicast_ipv6_announce.print();
-
     // We need to prepare very fancy NLRI first: https://github.com/osrg/gobgp/issues/2673
     // To be more specific:
     // https://github.com/fujita/gobgp/blob/7e4d9a0e89b1fc5e4fc9865b7b6431a00dcb60e2/pkg/server/grpc_server_test.go#L48

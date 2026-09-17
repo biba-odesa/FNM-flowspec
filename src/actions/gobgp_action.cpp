@@ -6,6 +6,10 @@
 
 #include "../bgp_protocol.hpp"
 
+#include "gobgp_flowspec_lifecycle.hpp"
+#include "gobgp_log_formatter.hpp"
+#include "gobgp_flowspec_rule_builder.hpp"
+
 #include "../gobgp_client/gobgp_client.hpp"
 
 #include "../fastnetmon_configuration_scheme.hpp"
@@ -13,6 +17,136 @@
 #include <cstdlib>
 
 extern fastnetmon_configuration_t fastnetmon_global_configuration;
+
+namespace {
+
+// This state is process-local. After a FastNetMon restart UUIDs for paths added before the restart are unavailable,
+// so reconciliation with already installed GoBGP FlowSpec paths is intentionally not implemented yet.
+gobgp_flowspec_lifecycle_t gobgp_flowspec_lifecycle;
+
+void withdraw_gobgp_flowspec_ipv4_rule(GrpcClient& gobgp_client,
+                                       const gobgp_flowspec_withdraw_request_t& withdraw_request) {
+    const std::string rule_details = format_gobgp_flowspec_rule(withdraw_request.flow_spec_rule);
+    const std::string uuid_details = format_gobgp_uuid_as_hex(withdraw_request.add_path_uuid);
+
+    logger << log4cpp::Priority::INFO << "GoBGP FlowSpec DELETE attempt " << rule_details << " " << uuid_details;
+
+    const bool withdraw_result = gobgp_client.WithdrawFlowSpecIPv4(withdraw_request.add_path_uuid);
+    gobgp_flowspec_withdraw_completion_t completion = gobgp_flowspec_lifecycle.complete_withdraw(
+        withdraw_request.rule_key, withdraw_request.add_path_uuid, withdraw_result);
+
+    if (withdraw_result) {
+        logger << log4cpp::Priority::INFO << "GoBGP FlowSpec DELETE success " << rule_details << " " << uuid_details;
+
+        if (completion != gobgp_flowspec_withdraw_completion_t::erased) {
+            logger << log4cpp::Priority::ERROR << "GoBGP FlowSpec DELETE completed but lifecycle state was not erased "
+                   << rule_details << " " << uuid_details;
+        }
+    } else {
+        logger << log4cpp::Priority::ERROR << "GoBGP FlowSpec DELETE failed " << rule_details << " " << uuid_details;
+    }
+}
+
+void announce_gobgp_flowspec_ipv4_rule(GrpcClient& gobgp_client,
+                                       const gobgp_flowspec_rule_key_t& rule_key,
+                                       const flow_spec_rule_t& flow_spec_rule) {
+    const std::string rule_details = format_gobgp_flowspec_rule(flow_spec_rule);
+
+    logger << log4cpp::Priority::INFO << "GoBGP FlowSpec ADD attempt " << rule_details;
+
+    std::string add_path_uuid;
+    if (!gobgp_client.AnnounceFlowSpecIPv4(flow_spec_rule, add_path_uuid)) {
+        gobgp_flowspec_lifecycle.fail_announce(rule_key);
+        logger << log4cpp::Priority::ERROR << "GoBGP FlowSpec ADD failed " << rule_details;
+        return;
+    }
+
+    if (add_path_uuid.empty()) {
+        gobgp_flowspec_lifecycle.fail_announce(rule_key);
+        logger << log4cpp::Priority::ERROR << "GoBGP FlowSpec ADD failed " << rule_details
+               << " because GoBGP returned an empty AddPath UUID";
+        return;
+    }
+
+    gobgp_flowspec_announce_completion_t completion =
+        gobgp_flowspec_lifecycle.complete_announce(rule_key, add_path_uuid);
+    const std::string uuid_details = format_gobgp_uuid_as_hex(add_path_uuid);
+
+    if (completion == gobgp_flowspec_announce_completion_t::installed) {
+        logger << log4cpp::Priority::INFO << "GoBGP FlowSpec ADD success " << rule_details << " " << uuid_details;
+        return;
+    }
+
+    if (completion == gobgp_flowspec_announce_completion_t::withdraw_required) {
+        logger << log4cpp::Priority::INFO << "GoBGP FlowSpec ADD success " << rule_details << " " << uuid_details;
+        logger << log4cpp::Priority::INFO << "GoBGP FlowSpec DELETE requested while ADD was in progress " << rule_details
+               << " " << uuid_details;
+
+        withdraw_gobgp_flowspec_ipv4_rule(gobgp_client, { rule_key, flow_spec_rule, add_path_uuid });
+        return;
+    }
+
+    logger << log4cpp::Priority::ERROR << "GoBGP FlowSpec ADD completed but lifecycle state was not updated " << rule_details
+           << " " << uuid_details;
+}
+
+void gobgp_ban_manage_flowspec_ipv4(GrpcClient& gobgp_client,
+                                    uint32_t client_ip,
+                                    bool is_withdrawal,
+                                    const attack_details_t& current_attack) {
+    if (is_withdrawal) {
+        gobgp_flowspec_withdraw_start_result_t withdraw_start = gobgp_flowspec_lifecycle.begin_withdraw_for_victim(client_ip);
+
+        if (withdraw_start.withdraw_requests.empty() && withdraw_start.deferred_rules.empty()
+            && withdraw_start.in_progress_rules.empty()) {
+            logger << log4cpp::Priority::INFO << "GoBGP FlowSpec DELETE skipped dst="
+                   << convert_ip_as_uint_to_string(client_ip) << "/32 reason=no_active_rules";
+            return;
+        }
+
+        for (const auto& flow_spec_rule : withdraw_start.deferred_rules) {
+            logger << log4cpp::Priority::INFO << "GoBGP FlowSpec DELETE deferred while ADD is in progress "
+                   << format_gobgp_flowspec_rule(flow_spec_rule);
+        }
+
+        for (const auto& flow_spec_rule : withdraw_start.in_progress_rules) {
+            logger << log4cpp::Priority::INFO << "GoBGP FlowSpec DELETE skipped because DELETE is already in progress "
+                   << format_gobgp_flowspec_rule(flow_spec_rule);
+        }
+
+        for (const auto& withdraw_request : withdraw_start.withdraw_requests) {
+            withdraw_gobgp_flowspec_ipv4_rule(gobgp_client, withdraw_request);
+        }
+
+        return;
+    }
+
+    uint32_t redirect_ipv4 = 0;
+    if (!convert_ip_as_string_to_uint_safe(fastnetmon_global_configuration.gobgp_flowspec_redirect_ipv4, redirect_ipv4)
+        || redirect_ipv4 == 0) {
+        logger << log4cpp::Priority::ERROR << "GoBGP FlowSpec ADD failed because configured redirect IPv4 is invalid";
+        return;
+    }
+
+    flow_spec_rule_t flow_spec_rule = build_gobgp_flowspec_ipv4_rule(client_ip, current_attack, redirect_ipv4);
+    gobgp_flowspec_rule_key_t rule_key;
+
+    if (!build_gobgp_flowspec_rule_key(flow_spec_rule, rule_key)) {
+        logger << log4cpp::Priority::ERROR << "GoBGP FlowSpec ADD failed because the generated rule has an invalid identity "
+               << format_gobgp_flowspec_rule(flow_spec_rule);
+        return;
+    }
+
+    if (!gobgp_flowspec_lifecycle.begin_announce(rule_key, flow_spec_rule)) {
+        logger << log4cpp::Priority::INFO << "GoBGP FlowSpec ADD skipped because an identical rule is already active "
+               << format_gobgp_flowspec_rule(flow_spec_rule);
+        return;
+    }
+
+    announce_gobgp_flowspec_ipv4_rule(gobgp_client, rule_key, flow_spec_rule);
+}
+
+} // namespace
 
 void gobgp_action_init() {
     logger << log4cpp::Priority::INFO << "GoBGP action module loaded";
@@ -172,7 +306,16 @@ void gobgp_ban_manage_ipv6(GrpcClient& gobgp_client,
         unicast_ipv6_announce.set_prefix(client_ipv6);
         unicast_ipv6_announce.set_next_hop(gobgp_next_hop_host_ipv6);
 
-        gobgp_client.AnnounceUnicastPrefixLowLevelIPv6(unicast_ipv6_announce, is_withdrawal);
+        const std::string route_details = format_gobgp_ipv6_unicast_route(unicast_ipv6_announce);
+        const char* operation           = is_withdrawal ? "WITHDRAW" : "ADD";
+
+        logger << log4cpp::Priority::INFO << "GoBGP IPv6 unicast " << operation << " attempt " << route_details;
+
+        if (gobgp_client.AnnounceUnicastPrefixLowLevelIPv6(unicast_ipv6_announce, is_withdrawal)) {
+            logger << log4cpp::Priority::INFO << "GoBGP IPv6 unicast " << operation << " success " << route_details;
+        } else {
+            logger << log4cpp::Priority::ERROR << "GoBGP IPv6 unicast " << operation << " failed " << route_details;
+        }
     }
 
     if (fastnetmon_global_configuration.gobgp_announce_whole_subnet_ipv6) {
@@ -181,6 +324,11 @@ void gobgp_ban_manage_ipv6(GrpcClient& gobgp_client,
 }
 
 void gobgp_ban_manage_ipv4(GrpcClient& gobgp_client, uint32_t client_ip, bool is_withdrawal, const attack_details_t& current_attack) {
+    if (fastnetmon_global_configuration.gobgp_flowspec) {
+        gobgp_ban_manage_flowspec_ipv4(gobgp_client, client_ip, is_withdrawal, current_attack);
+        return;
+    }
+
     // Previously we used same next hop for both subnet and host
     uint32_t next_hop_as_integer_legacy = 0;
 
@@ -258,7 +406,16 @@ void gobgp_ban_manage_ipv4(GrpcClient& gobgp_client, uint32_t client_ip, bool is
         unicast_ipv4_announce.set_prefix(customer_network);
         unicast_ipv4_announce.set_next_hop(gobgp_next_hop_subnet_ipv4);
 
-        gobgp_client.AnnounceUnicastPrefixLowLevelIPv4(unicast_ipv4_announce, is_withdrawal);
+        const std::string route_details = format_gobgp_ipv4_unicast_route(unicast_ipv4_announce);
+        const char* operation           = is_withdrawal ? "WITHDRAW" : "ADD";
+
+        logger << log4cpp::Priority::INFO << "GoBGP IPv4 unicast " << operation << " attempt " << route_details;
+
+        if (gobgp_client.AnnounceUnicastPrefixLowLevelIPv4(unicast_ipv4_announce, is_withdrawal)) {
+            logger << log4cpp::Priority::INFO << "GoBGP IPv4 unicast " << operation << " success " << route_details;
+        } else {
+            logger << log4cpp::Priority::ERROR << "GoBGP IPv4 unicast " << operation << " failed " << route_details;
+        }
     }
 
     if (fastnetmon_global_configuration.gobgp_announce_host) {
@@ -285,7 +442,16 @@ void gobgp_ban_manage_ipv4(GrpcClient& gobgp_client, uint32_t client_ip, bool is
         unicast_ipv4_announce.set_prefix(host_address_as_subnet);
         unicast_ipv4_announce.set_next_hop(gobgp_next_hop_host_ipv4);
 
-        gobgp_client.AnnounceUnicastPrefixLowLevelIPv4(unicast_ipv4_announce, is_withdrawal);
+        const std::string route_details = format_gobgp_ipv4_unicast_route(unicast_ipv4_announce);
+        const char* operation           = is_withdrawal ? "WITHDRAW" : "ADD";
+
+        logger << log4cpp::Priority::INFO << "GoBGP IPv4 unicast " << operation << " attempt " << route_details;
+
+        if (gobgp_client.AnnounceUnicastPrefixLowLevelIPv4(unicast_ipv4_announce, is_withdrawal)) {
+            logger << log4cpp::Priority::INFO << "GoBGP IPv4 unicast " << operation << " success " << route_details;
+        } else {
+            logger << log4cpp::Priority::ERROR << "GoBGP IPv4 unicast " << operation << " failed " << route_details;
+        }
     }
 }
 
