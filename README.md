@@ -9,6 +9,16 @@ What do we do?
 We detect hosts in the deployed network sending or receiving large volumes of traffic, packets/bytes/flows per second and
 perform a configurable action to handle that event. These configurable actions include notifying you, calling script or making BGP announcements. 
 
+About this fork
+---------------
+This is an experimental fork of FastNetMon Community Edition. Its primary goal is GoBGP IPv4 FlowSpec mitigation.
+
+Implemented FlowSpec capabilities include IPv4 FlowSpec announcements and withdrawals through GoBGP, redirect-to-IPv4 actions, protocol-aware rules (TCP, UDP, ICMP, or destination-only), optional dominant destination-port classification for TCP/UDP attacks, and success notifications for FlowSpec changes.
+
+This is not an official FastNetMon release and is not endorsed by or affiliated with FastNetMon LTD. The upstream project is [FastNetMon Community Edition](https://github.com/pavel-odintsov/fastnetmon). FastNetMon is a trademark of FastNetMon LTD.
+
+This fork retains the original licensing and copyright notices. Applicable terms are available in [LICENSE](LICENSE) and the upstream [FastNetMon Community Edition Terms and Conditions](https://fastnetmon.com/fastnetmon-community-edition-terms-and-conditions/).
+
 Project 
 -------
 🌏️ [Official site](https://fastnetmon.com)  
