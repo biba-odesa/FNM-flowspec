@@ -2,6 +2,7 @@
 
 #include "../fastnetmon_types.hpp"
 #include "..//attack_details.hpp"
+#include "gobgp_flowspec_port_classifier.hpp"
 
 #include <string>
 #include <optional>
@@ -13,4 +14,5 @@ void gobgp_ban_manage(const std::string& action,
                       uint32_t client_ip,
                       const subnet_ipv6_cidr_mask_t& client_ipv6,
                       const attack_details_t& current_attack,
-                      std::optional<uint16_t> selected_destination_port = std::nullopt);
+                      std::optional<uint16_t> selected_destination_port = std::nullopt,
+                      std::optional<gobgp_flowspec_port_classifier_result_t> classifier_result = std::nullopt);

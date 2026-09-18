@@ -4,6 +4,7 @@
 #include "bgp_protocol_flow_spec.hpp"
 #include "actions/gobgp_flowspec_lifecycle.hpp"
 #include "actions/gobgp_flowspec_port_classifier.hpp"
+#include "actions/gobgp_flowspec_notification_formatter.hpp"
 #include "actions/gobgp_flowspec_rule_builder.hpp"
 #include "actions/gobgp_log_formatter.hpp"
 #include "fast_library.hpp"
@@ -673,6 +674,53 @@ TEST(gobgp_flowspec_port_classifier, outgoing_attacks_are_not_classified) {
                                                             samples, make_gobgp_flowspec_port_config(1));
     EXPECT_FALSE(result.selected_destination_port.has_value());
     EXPECT_EQ(result.reason, gobgp_flowspec_port_classifier_reason_t::not_incoming);
+}
+
+TEST(gobgp_flowspec_notification_formatter, add_success_report_uses_exact_rule_uuid_and_classifier_result) {
+    uint32_t destination_ipv4 = 0;
+    uint32_t redirect_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", destination_ipv4));
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("192.168.100.50", redirect_ipv4));
+
+    flow_spec_rule_t flow_spec_rule;
+    flow_spec_rule.set_destination_subnet_ipv4(subnet_cidr_mask_t(destination_ipv4, 32));
+    flow_spec_rule.add_protocol(ip_protocol_t::UDP);
+    flow_spec_rule.add_destination_port(53);
+    flow_spec_rule.add_ipv4_nexthop(redirect_ipv4);
+
+    gobgp_flowspec_port_classifier_result_t classifier_result;
+    classifier_result.dominant_port = 53;
+    classifier_result.selected_destination_port = 53;
+    classifier_result.dominance_percent = 94;
+    classifier_result.qualifying_sample_count = 37;
+    classifier_result.reason = gobgp_flowspec_port_classifier_reason_t::selected;
+
+    EXPECT_EQ(format_gobgp_flowspec_add_success_notification(flow_spec_rule, std::string("\x00\xff", 2), classifier_result),
+              "FlowSpec ADD success (GoBGP)\n"
+              "Rule: dst=10.10.10.10/32 protocol=UDP dst_port=53 redirect=192.168.100.50\n"
+              "UUID: uuid=hex:00ff\n"
+              "Dominant port: 53\n"
+              "Selected port: 53\n"
+              "Dominance: 94%\n"
+              "Qualifying samples: 37\n"
+              "Classifier reason: selected\n");
+}
+
+TEST(gobgp_flowspec_notification_formatter, delete_success_report_uses_lifecycle_rule_without_classifier_result) {
+    uint32_t destination_ipv4 = 0;
+    uint32_t redirect_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", destination_ipv4));
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("192.168.100.50", redirect_ipv4));
+
+    flow_spec_rule_t flow_spec_rule;
+    flow_spec_rule.set_destination_subnet_ipv4(subnet_cidr_mask_t(destination_ipv4, 32));
+    flow_spec_rule.add_protocol(ip_protocol_t::ICMP);
+    flow_spec_rule.add_ipv4_nexthop(redirect_ipv4);
+
+    EXPECT_EQ(format_gobgp_flowspec_delete_success_notification(flow_spec_rule, std::string("\x01\x02", 2)),
+              "FlowSpec DELETE success (GoBGP)\n"
+              "Rule: dst=10.10.10.10/32 protocol=ICMP redirect=192.168.100.50\n"
+              "UUID: uuid=hex:0102\n");
 }
 
 /* Patricia tests */

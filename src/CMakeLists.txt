@@ -622,6 +622,7 @@ add_library(gobgp_flowspec_rule_builder STATIC actions/gobgp_flowspec_rule_build
 add_library(gobgp_flowspec_lifecycle STATIC actions/gobgp_flowspec_lifecycle.cpp)
 add_library(gobgp_log_formatter STATIC actions/gobgp_log_formatter.cpp)
 add_library(gobgp_flowspec_port_classifier STATIC actions/gobgp_flowspec_port_classifier.cpp)
+add_library(gobgp_flowspec_notification_formatter STATIC actions/gobgp_flowspec_notification_formatter.cpp)
 
 if (LINK_WITH_ABSL)
     find_package(absl REQUIRED ${DISABLE_DEFAULT_PATH_SEARCH_VAR})
@@ -643,6 +644,7 @@ if (ENABLE_GOBGP_SUPPORT)
     target_link_libraries(gobgp_action gobgp_flowspec_rule_builder)
     target_link_libraries(gobgp_action gobgp_flowspec_lifecycle)
     target_link_libraries(gobgp_action gobgp_log_formatter)
+    target_link_libraries(gobgp_action gobgp_flowspec_notification_formatter)
 
     # We use find_package for Windows as our approach for *nix platforms leads to bunch of linking errors
     if (${CMAKE_SYSTEM_NAME} STREQUAL "Windows")
@@ -1131,6 +1133,7 @@ if (BUILD_TESTS)
     target_link_libraries(fastnetmon_tests gobgp_flowspec_lifecycle)
     target_link_libraries(fastnetmon_tests gobgp_log_formatter)
     target_link_libraries(fastnetmon_tests gobgp_flowspec_port_classifier)
+    target_link_libraries(fastnetmon_tests gobgp_flowspec_notification_formatter)
     target_link_libraries(fastnetmon_tests ${CMAKE_THREAD_LIBS_INIT})
     target_link_libraries(fastnetmon_tests ${Boost_LIBRARIES})
     target_link_libraries(fastnetmon_tests ${LOG4CPP_LIBRARY_PATH})

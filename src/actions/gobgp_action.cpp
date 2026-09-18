@@ -8,6 +8,7 @@
 
 #include "gobgp_flowspec_lifecycle.hpp"
 #include "gobgp_log_formatter.hpp"
+#include "gobgp_flowspec_notification_formatter.hpp"
 #include "gobgp_flowspec_rule_builder.hpp"
 
 #include "../gobgp_client/gobgp_client.hpp"
@@ -18,7 +19,11 @@
 #include <cerrno>
 #include <limits>
 
+#include <boost/thread.hpp>
+
 extern fastnetmon_configuration_t fastnetmon_global_configuration;
+
+bool exec_with_stdin_params(std::string cmd, std::string params);
 
 namespace {
 
@@ -45,6 +50,38 @@ bool parse_positive_gobgp_flowspec_option(const std::string& option_name,
     return true;
 }
 
+void send_gobgp_flowspec_success_notification(
+    const std::string& event,
+    const flow_spec_rule_t& flow_spec_rule,
+    const std::string& add_path_uuid,
+    const std::optional<gobgp_flowspec_port_classifier_result_t>& classifier_result = std::nullopt) {
+    const std::string& notification_script = fastnetmon_global_configuration.gobgp_flowspec_notify_script_path;
+    if (notification_script.empty()) {
+        return;
+    }
+
+    if (!flow_spec_rule.destination_subnet_ipv4_used || flow_spec_rule.destination_subnet_ipv4.cidr_prefix_length != 32) {
+        logger << log4cpp::Priority::ERROR << "GoBGP FlowSpec " << event
+               << " notification skipped because the successful rule has no IPv4 /32 destination";
+        return;
+    }
+
+    const std::string victim_ip = convert_ip_as_uint_to_string(flow_spec_rule.destination_subnet_ipv4.subnet_address);
+    const std::string command = notification_script + " " + event + " " + victim_ip;
+    std::string report;
+
+    if (event == "add") {
+        report = format_gobgp_flowspec_add_success_notification(flow_spec_rule, add_path_uuid, classifier_result);
+    } else {
+        report = format_gobgp_flowspec_delete_success_notification(flow_spec_rule, add_path_uuid);
+    }
+
+    logger << log4cpp::Priority::INFO << "GoBGP FlowSpec " << event << " success notification scheduled for "
+           << victim_ip;
+    boost::thread notification_thread(exec_with_stdin_params, command, report);
+    notification_thread.detach();
+}
+
 void withdraw_gobgp_flowspec_ipv4_rule(GrpcClient& gobgp_client,
                                        const gobgp_flowspec_withdraw_request_t& withdraw_request) {
     const std::string rule_details = format_gobgp_flowspec_rule(withdraw_request.flow_spec_rule);
@@ -59,6 +96,9 @@ void withdraw_gobgp_flowspec_ipv4_rule(GrpcClient& gobgp_client,
     if (withdraw_result) {
         logger << log4cpp::Priority::INFO << "GoBGP FlowSpec DELETE success " << rule_details << " " << uuid_details;
 
+        send_gobgp_flowspec_success_notification("delete", withdraw_request.flow_spec_rule,
+                                                  withdraw_request.add_path_uuid);
+
         if (completion != gobgp_flowspec_withdraw_completion_t::erased) {
             logger << log4cpp::Priority::ERROR << "GoBGP FlowSpec DELETE completed but lifecycle state was not erased "
                    << rule_details << " " << uuid_details;
@@ -70,7 +110,8 @@ void withdraw_gobgp_flowspec_ipv4_rule(GrpcClient& gobgp_client,
 
 void announce_gobgp_flowspec_ipv4_rule(GrpcClient& gobgp_client,
                                        const gobgp_flowspec_rule_key_t& rule_key,
-                                       const flow_spec_rule_t& flow_spec_rule) {
+                                       const flow_spec_rule_t& flow_spec_rule,
+                                       const std::optional<gobgp_flowspec_port_classifier_result_t>& classifier_result) {
     const std::string rule_details = format_gobgp_flowspec_rule(flow_spec_rule);
 
     logger << log4cpp::Priority::INFO << "GoBGP FlowSpec ADD attempt " << rule_details;
@@ -88,6 +129,8 @@ void announce_gobgp_flowspec_ipv4_rule(GrpcClient& gobgp_client,
                << " because GoBGP returned an empty AddPath UUID";
         return;
     }
+
+    send_gobgp_flowspec_success_notification("add", flow_spec_rule, add_path_uuid, classifier_result);
 
     gobgp_flowspec_announce_completion_t completion =
         gobgp_flowspec_lifecycle.complete_announce(rule_key, add_path_uuid);
@@ -115,7 +158,8 @@ void gobgp_ban_manage_flowspec_ipv4(GrpcClient& gobgp_client,
                                     uint32_t client_ip,
                                     bool is_withdrawal,
                                     const attack_details_t& current_attack,
-                                    std::optional<uint16_t> selected_destination_port) {
+                                    std::optional<uint16_t> selected_destination_port,
+                                    const std::optional<gobgp_flowspec_port_classifier_result_t>& classifier_result) {
     if (is_withdrawal) {
         gobgp_flowspec_withdraw_start_result_t withdraw_start = gobgp_flowspec_lifecycle.begin_withdraw_for_victim(client_ip);
 
@@ -166,7 +210,7 @@ void gobgp_ban_manage_flowspec_ipv4(GrpcClient& gobgp_client,
         return;
     }
 
-    announce_gobgp_flowspec_ipv4_rule(gobgp_client, rule_key, flow_spec_rule);
+    announce_gobgp_flowspec_ipv4_rule(gobgp_client, rule_key, flow_spec_rule, classifier_result);
 }
 
 } // namespace
@@ -224,6 +268,11 @@ void gobgp_action_init() {
 
     if (configuration_map.count("gobgp_flowspec_redirect_ipv4")) {
         fastnetmon_global_configuration.gobgp_flowspec_redirect_ipv4 = configuration_map["gobgp_flowspec_redirect_ipv4"];
+    }
+
+    if (configuration_map.count("gobgp_flowspec_notify_script_path")) {
+        fastnetmon_global_configuration.gobgp_flowspec_notify_script_path =
+            configuration_map["gobgp_flowspec_notify_script_path"];
     }
 
     if (configuration_map.count("gobgp_flowspec_port_detection")) {
@@ -379,9 +428,11 @@ void gobgp_ban_manage_ipv4(GrpcClient& gobgp_client,
                            uint32_t client_ip,
                            bool is_withdrawal,
                            const attack_details_t& current_attack,
-                           std::optional<uint16_t> selected_destination_port) {
+                           std::optional<uint16_t> selected_destination_port,
+                           const std::optional<gobgp_flowspec_port_classifier_result_t>& classifier_result) {
     if (fastnetmon_global_configuration.gobgp_flowspec) {
-        gobgp_ban_manage_flowspec_ipv4(gobgp_client, client_ip, is_withdrawal, current_attack, selected_destination_port);
+        gobgp_ban_manage_flowspec_ipv4(gobgp_client, client_ip, is_withdrawal, current_attack, selected_destination_port,
+                                       classifier_result);
         return;
     }
 
@@ -517,7 +568,8 @@ void gobgp_ban_manage(const std::string& action,
                       uint32_t client_ip,
                       const subnet_ipv6_cidr_mask_t& client_ipv6,
                       const attack_details_t& current_attack,
-                      std::optional<uint16_t> selected_destination_port) {
+                      std::optional<uint16_t> selected_destination_port,
+                      std::optional<gobgp_flowspec_port_classifier_result_t> classifier_result) {
     GrpcClient gobgp_client = GrpcClient(grpc::CreateChannel("localhost:50051", grpc::InsecureChannelCredentials()));
 
     bool is_withdrawal = false;
@@ -535,6 +587,7 @@ void gobgp_ban_manage(const std::string& action,
     if (ipv6) {
         gobgp_ban_manage_ipv6(gobgp_client, client_ipv6, is_withdrawal, current_attack);
     } else {
-        gobgp_ban_manage_ipv4(gobgp_client, client_ip, is_withdrawal, current_attack, selected_destination_port);
+        gobgp_ban_manage_ipv4(gobgp_client, client_ip, is_withdrawal, current_attack, selected_destination_port,
+                               classifier_result);
     }
 }
