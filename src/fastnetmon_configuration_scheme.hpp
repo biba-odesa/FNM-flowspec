@@ -62,6 +62,9 @@ class fastnetmon_configuration_t {
     bool gobgp{ false };
     bool gobgp_flowspec{ false };
     std::string gobgp_flowspec_redirect_ipv4{ "0.0.0.0" };
+    bool gobgp_flowspec_port_detection{ true };
+    uint64_t gobgp_flowspec_port_min_samples{ 10 };
+    uint8_t gobgp_flowspec_port_dominance_percent{ 70 };
 
     // IPv4
     bool gobgp_announce_host{ false };

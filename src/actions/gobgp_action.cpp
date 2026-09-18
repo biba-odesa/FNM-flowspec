@@ -15,6 +15,8 @@
 #include "../fastnetmon_configuration_scheme.hpp"
 
 #include <cstdlib>
+#include <cerrno>
+#include <limits>
 
 extern fastnetmon_configuration_t fastnetmon_global_configuration;
 
@@ -23,6 +25,25 @@ namespace {
 // This state is process-local. After a FastNetMon restart UUIDs for paths added before the restart are unavailable,
 // so reconciliation with already installed GoBGP FlowSpec paths is intentionally not implemented yet.
 gobgp_flowspec_lifecycle_t gobgp_flowspec_lifecycle;
+
+bool parse_positive_gobgp_flowspec_option(const std::string& option_name,
+                                          const std::string& option_value,
+                                          uint64_t maximum_value,
+                                          uint64_t& parsed_value) {
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long long value = std::strtoull(option_value.c_str(), &end, 10);
+
+    if (option_value.empty() || option_value.front() == '-' || errno == ERANGE || end == option_value.c_str()
+        || *end != '\0' || value == 0 || value > maximum_value) {
+        logger << log4cpp::Priority::ERROR << "Configuration error: " << option_name << " must be in range 1.."
+               << maximum_value;
+        return false;
+    }
+
+    parsed_value = value;
+    return true;
+}
 
 void withdraw_gobgp_flowspec_ipv4_rule(GrpcClient& gobgp_client,
                                        const gobgp_flowspec_withdraw_request_t& withdraw_request) {
@@ -93,7 +114,8 @@ void announce_gobgp_flowspec_ipv4_rule(GrpcClient& gobgp_client,
 void gobgp_ban_manage_flowspec_ipv4(GrpcClient& gobgp_client,
                                     uint32_t client_ip,
                                     bool is_withdrawal,
-                                    const attack_details_t& current_attack) {
+                                    const attack_details_t& current_attack,
+                                    std::optional<uint16_t> selected_destination_port) {
     if (is_withdrawal) {
         gobgp_flowspec_withdraw_start_result_t withdraw_start = gobgp_flowspec_lifecycle.begin_withdraw_for_victim(client_ip);
 
@@ -128,7 +150,8 @@ void gobgp_ban_manage_flowspec_ipv4(GrpcClient& gobgp_client,
         return;
     }
 
-    flow_spec_rule_t flow_spec_rule = build_gobgp_flowspec_ipv4_rule(client_ip, current_attack, redirect_ipv4);
+    flow_spec_rule_t flow_spec_rule =
+        build_gobgp_flowspec_ipv4_rule(client_ip, current_attack, redirect_ipv4, selected_destination_port);
     gobgp_flowspec_rule_key_t rule_key;
 
     if (!build_gobgp_flowspec_rule_key(flow_spec_rule, rule_key)) {
@@ -203,6 +226,11 @@ void gobgp_action_init() {
         fastnetmon_global_configuration.gobgp_flowspec_redirect_ipv4 = configuration_map["gobgp_flowspec_redirect_ipv4"];
     }
 
+    if (configuration_map.count("gobgp_flowspec_port_detection")) {
+        fastnetmon_global_configuration.gobgp_flowspec_port_detection =
+            configuration_map["gobgp_flowspec_port_detection"] == "on";
+    }
+
     if (fastnetmon_global_configuration.gobgp_flowspec) {
         uint32_t redirect_ipv4 = 0;
 
@@ -212,6 +240,30 @@ void gobgp_action_init() {
                    << "Configuration error: gobgp_flowspec=on requires a non-zero valid IPv4 "
                       "gobgp_flowspec_redirect_ipv4";
             exit(1);
+        }
+
+        uint64_t parsed_value = 0;
+        if (configuration_map.count("gobgp_flowspec_port_min_samples")
+            && !parse_positive_gobgp_flowspec_option("gobgp_flowspec_port_min_samples",
+                                                      configuration_map["gobgp_flowspec_port_min_samples"],
+                                                      std::numeric_limits<uint64_t>::max(), parsed_value)) {
+            exit(1);
+        }
+
+        if (configuration_map.count("gobgp_flowspec_port_min_samples")) {
+            fastnetmon_global_configuration.gobgp_flowspec_port_min_samples = parsed_value;
+        }
+
+        if (configuration_map.count("gobgp_flowspec_port_dominance_percent")
+            && !parse_positive_gobgp_flowspec_option("gobgp_flowspec_port_dominance_percent",
+                                                      configuration_map["gobgp_flowspec_port_dominance_percent"],
+                                                      100, parsed_value)) {
+            exit(1);
+        }
+
+        if (configuration_map.count("gobgp_flowspec_port_dominance_percent")) {
+            fastnetmon_global_configuration.gobgp_flowspec_port_dominance_percent =
+                static_cast<uint8_t>(parsed_value);
         }
     }
 }
@@ -323,9 +375,13 @@ void gobgp_ban_manage_ipv6(GrpcClient& gobgp_client,
     }
 }
 
-void gobgp_ban_manage_ipv4(GrpcClient& gobgp_client, uint32_t client_ip, bool is_withdrawal, const attack_details_t& current_attack) {
+void gobgp_ban_manage_ipv4(GrpcClient& gobgp_client,
+                           uint32_t client_ip,
+                           bool is_withdrawal,
+                           const attack_details_t& current_attack,
+                           std::optional<uint16_t> selected_destination_port) {
     if (fastnetmon_global_configuration.gobgp_flowspec) {
-        gobgp_ban_manage_flowspec_ipv4(gobgp_client, client_ip, is_withdrawal, current_attack);
+        gobgp_ban_manage_flowspec_ipv4(gobgp_client, client_ip, is_withdrawal, current_attack, selected_destination_port);
         return;
     }
 
@@ -460,7 +516,8 @@ void gobgp_ban_manage(const std::string& action,
                       bool ipv6,
                       uint32_t client_ip,
                       const subnet_ipv6_cidr_mask_t& client_ipv6,
-                      const attack_details_t& current_attack) {
+                      const attack_details_t& current_attack,
+                      std::optional<uint16_t> selected_destination_port) {
     GrpcClient gobgp_client = GrpcClient(grpc::CreateChannel("localhost:50051", grpc::InsecureChannelCredentials()));
 
     bool is_withdrawal = false;
@@ -478,6 +535,6 @@ void gobgp_ban_manage(const std::string& action,
     if (ipv6) {
         gobgp_ban_manage_ipv6(gobgp_client, client_ipv6, is_withdrawal, current_attack);
     } else {
-    	gobgp_ban_manage_ipv4(gobgp_client, client_ip, is_withdrawal, current_attack);
+        gobgp_ban_manage_ipv4(gobgp_client, client_ip, is_withdrawal, current_attack, selected_destination_port);
     }
 }

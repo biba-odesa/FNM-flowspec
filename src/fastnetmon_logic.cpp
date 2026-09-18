@@ -6,6 +6,7 @@
 #include <sstream>
 #include <thread>
 #include <vector>
+#include <optional>
 
 #include <boost/asio/ip/tcp.hpp>
 
@@ -43,6 +44,7 @@
 
 #ifdef ENABLE_GOBGP
 #include "actions/gobgp_action.hpp"
+#include "actions/gobgp_flowspec_port_classifier.hpp"
 #endif
 
 #include "actions/exabgp_action.hpp"
@@ -1308,7 +1310,32 @@ void call_blackhole_actions_per_host(attack_action_t attack_action,
     if (fastnetmon_global_configuration.gobgp) {
         logger << log4cpp::Priority::INFO << "Call GoBGP for " << action_name << " client started: " << client_ip_as_string;
 
-        boost::thread gobgp_thread(gobgp_ban_manage, action_name, ipv6, client_ip, client_ipv6, current_attack);
+        std::optional<uint16_t> selected_destination_port;
+
+        if (attack_action == attack_action_t::ban && attack_detection_source == attack_detection_source_t::Automatic && ipv4
+            && current_attack.attack_direction == INCOMING && fastnetmon_global_configuration.gobgp_flowspec
+            && fastnetmon_global_configuration.gobgp_flowspec_port_detection) {
+            const gobgp_flowspec_port_classifier_config_t classifier_config = {
+                fastnetmon_global_configuration.gobgp_flowspec_port_min_samples,
+                fastnetmon_global_configuration.gobgp_flowspec_port_dominance_percent,
+            };
+            const gobgp_flowspec_port_classifier_result_t classifier_result = classify_gobgp_flowspec_destination_port(
+                client_ip, current_attack, simple_packets_buffer, classifier_config);
+            selected_destination_port = classifier_result.selected_destination_port;
+
+            logger << log4cpp::Priority::INFO << "GoBGP FlowSpec port classifier dst=" << client_ip_as_string
+                   << " protocol=" << get_ip_protocol_name(
+                          get_ip_protocol_enum_type_from_integer(static_cast<uint8_t>(current_attack.attack_protocol)))
+                   << " selected_port="
+                   << (selected_destination_port.has_value() ? std::to_string(*selected_destination_port) : "none")
+                   << " dominance=" << static_cast<unsigned int>(classifier_result.dominance_percent)
+                   << "% samples=" << classifier_result.qualifying_sample_count
+                   << " total_weight=" << classifier_result.total_weight
+                   << " reason=" << get_gobgp_flowspec_port_classifier_reason_name(classifier_result.reason);
+        }
+
+        boost::thread gobgp_thread(gobgp_ban_manage, action_name, ipv6, client_ip, client_ipv6, current_attack,
+                                   selected_destination_port);
         gobgp_thread.detach();
 
         logger << log4cpp::Priority::INFO << "Call to GoBGP for " << action_name << " client is finished: " << client_ip_as_string;

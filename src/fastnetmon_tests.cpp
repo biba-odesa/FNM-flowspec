@@ -3,6 +3,7 @@
 
 #include "bgp_protocol_flow_spec.hpp"
 #include "actions/gobgp_flowspec_lifecycle.hpp"
+#include "actions/gobgp_flowspec_port_classifier.hpp"
 #include "actions/gobgp_flowspec_rule_builder.hpp"
 #include "actions/gobgp_log_formatter.hpp"
 #include "fast_library.hpp"
@@ -52,6 +53,43 @@ gobgp_flowspec_rule_key_t make_gobgp_flowspec_lifecycle_key(const flow_spec_rule
     gobgp_flowspec_rule_key_t rule_key;
     EXPECT_TRUE(build_gobgp_flowspec_rule_key(flow_spec_rule, rule_key));
     return rule_key;
+}
+
+simple_packet_t make_gobgp_flowspec_port_sample(uint32_t victim_ipv4,
+                                                unsigned int protocol,
+                                                uint16_t destination_port,
+                                                uint64_t number_of_packets = 1,
+                                                uint32_t sample_ratio = 1) {
+    simple_packet_t packet;
+    packet.ip_protocol_version = 4;
+    packet.packet_direction = INCOMING;
+    packet.dst_ip = victim_ipv4;
+    packet.protocol = protocol;
+    packet.destination_port = destination_port;
+    packet.number_of_packets = number_of_packets;
+    packet.sample_ratio = sample_ratio;
+    return packet;
+}
+
+attack_details_t make_gobgp_flowspec_port_attack(unsigned int protocol, direction_t direction = INCOMING) {
+    attack_details_t current_attack;
+    current_attack.attack_protocol = protocol;
+    current_attack.attack_direction = direction;
+    return current_attack;
+}
+
+boost::circular_buffer<simple_packet_t> make_gobgp_flowspec_port_samples(std::initializer_list<simple_packet_t> samples) {
+    boost::circular_buffer<simple_packet_t> result(samples.size());
+    for (const auto& sample : samples) {
+        result.push_back(sample);
+    }
+
+    return result;
+}
+
+gobgp_flowspec_port_classifier_config_t make_gobgp_flowspec_port_config(uint64_t min_samples = 2,
+                                                                          uint8_t dominance_percent = 70) {
+    return { min_samples, dominance_percent };
 }
 
 } // namespace
@@ -461,6 +499,180 @@ TEST(gobgp_flowspec_rule_builder, unsupported_protocol) {
     const std::array<uint8_t, 7> expected_nlri = { 0x06, 0x01, 0x20, 0x0a, 0x0a, 0x0a, 0x0a };
     ASSERT_EQ(encoded_nlri.get_used_size(), expected_nlri.size());
     EXPECT_EQ(memcmp(encoded_nlri.get_pointer(), expected_nlri.data(), expected_nlri.size()), 0);
+}
+
+TEST(gobgp_flowspec_rule_builder, tcp_selected_destination_port) {
+    uint32_t victim_ipv4 = 0;
+    uint32_t redirect_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", victim_ipv4));
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("192.168.100.50", redirect_ipv4));
+
+    attack_details_t current_attack = make_gobgp_flowspec_port_attack(static_cast<unsigned int>(ip_protocol_t::TCP));
+    flow_spec_rule_t flow_spec_rule = build_gobgp_flowspec_ipv4_rule(victim_ipv4, current_attack, redirect_ipv4, 443);
+
+    EXPECT_EQ(flow_spec_rule.protocols, std::vector<ip_protocol_t>{ ip_protocol_t::TCP });
+    EXPECT_EQ(flow_spec_rule.destination_ports, std::vector<uint16_t>{ 443 });
+}
+
+TEST(gobgp_flowspec_rule_builder, udp_selected_destination_port) {
+    uint32_t victim_ipv4 = 0;
+    uint32_t redirect_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", victim_ipv4));
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("192.168.100.50", redirect_ipv4));
+
+    attack_details_t current_attack = make_gobgp_flowspec_port_attack(static_cast<unsigned int>(ip_protocol_t::UDP));
+    flow_spec_rule_t flow_spec_rule = build_gobgp_flowspec_ipv4_rule(victim_ipv4, current_attack, redirect_ipv4, 53);
+
+    EXPECT_EQ(flow_spec_rule.protocols, std::vector<ip_protocol_t>{ ip_protocol_t::UDP });
+    EXPECT_EQ(flow_spec_rule.destination_ports, std::vector<uint16_t>{ 53 });
+}
+
+TEST(gobgp_flowspec_rule_builder, icmp_ignores_selected_destination_port) {
+    uint32_t victim_ipv4 = 0;
+    uint32_t redirect_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", victim_ipv4));
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("192.168.100.50", redirect_ipv4));
+
+    attack_details_t current_attack = make_gobgp_flowspec_port_attack(static_cast<unsigned int>(ip_protocol_t::ICMP));
+    flow_spec_rule_t flow_spec_rule = build_gobgp_flowspec_ipv4_rule(victim_ipv4, current_attack, redirect_ipv4, 443);
+
+    EXPECT_EQ(flow_spec_rule.protocols, std::vector<ip_protocol_t>{ ip_protocol_t::ICMP });
+    EXPECT_TRUE(flow_spec_rule.destination_ports.empty());
+}
+
+TEST(gobgp_flowspec_port_classifier, tcp_dominant_port_is_selected) {
+    uint32_t victim_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", victim_ipv4));
+    const unsigned int tcp = static_cast<unsigned int>(ip_protocol_t::TCP);
+    auto samples = make_gobgp_flowspec_port_samples({ make_gobgp_flowspec_port_sample(victim_ipv4, tcp, 443, 9),
+                                                       make_gobgp_flowspec_port_sample(victim_ipv4, tcp, 80) });
+    auto result = classify_gobgp_flowspec_destination_port(victim_ipv4, make_gobgp_flowspec_port_attack(tcp), samples,
+                                                            make_gobgp_flowspec_port_config());
+    EXPECT_EQ(result.selected_destination_port, std::optional<uint16_t>(443));
+    EXPECT_EQ(result.dominance_percent, 90);
+    EXPECT_EQ(result.qualifying_sample_count, 2U);
+    EXPECT_EQ(result.reason, gobgp_flowspec_port_classifier_reason_t::selected);
+}
+
+TEST(gobgp_flowspec_port_classifier, udp_dominant_port_is_selected) {
+    uint32_t victim_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", victim_ipv4));
+    const unsigned int udp = static_cast<unsigned int>(ip_protocol_t::UDP);
+    auto samples = make_gobgp_flowspec_port_samples({ make_gobgp_flowspec_port_sample(victim_ipv4, udp, 53, 8),
+                                                       make_gobgp_flowspec_port_sample(victim_ipv4, udp, 123, 2) });
+    auto result = classify_gobgp_flowspec_destination_port(victim_ipv4, make_gobgp_flowspec_port_attack(udp), samples,
+                                                            make_gobgp_flowspec_port_config());
+    EXPECT_EQ(result.selected_destination_port, std::optional<uint16_t>(53));
+}
+
+TEST(gobgp_flowspec_port_classifier, multiple_udp_ports_below_dominance_are_not_selected) {
+    uint32_t victim_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", victim_ipv4));
+    const unsigned int udp = static_cast<unsigned int>(ip_protocol_t::UDP);
+    auto samples = make_gobgp_flowspec_port_samples({ make_gobgp_flowspec_port_sample(victim_ipv4, udp, 53, 6),
+                                                       make_gobgp_flowspec_port_sample(victim_ipv4, udp, 123, 4) });
+    auto result = classify_gobgp_flowspec_destination_port(victim_ipv4, make_gobgp_flowspec_port_attack(udp), samples,
+                                                            make_gobgp_flowspec_port_config());
+    EXPECT_FALSE(result.selected_destination_port.has_value());
+    EXPECT_EQ(result.reason, gobgp_flowspec_port_classifier_reason_t::below_dominance);
+}
+
+TEST(gobgp_flowspec_port_classifier, insufficient_samples_are_not_selected) {
+    uint32_t victim_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", victim_ipv4));
+    const unsigned int tcp = static_cast<unsigned int>(ip_protocol_t::TCP);
+    auto samples = make_gobgp_flowspec_port_samples({ make_gobgp_flowspec_port_sample(victim_ipv4, tcp, 443, 100) });
+    auto result = classify_gobgp_flowspec_destination_port(victim_ipv4, make_gobgp_flowspec_port_attack(tcp), samples,
+                                                            make_gobgp_flowspec_port_config(2));
+    EXPECT_FALSE(result.selected_destination_port.has_value());
+    EXPECT_EQ(result.reason, gobgp_flowspec_port_classifier_reason_t::insufficient_samples);
+}
+
+TEST(gobgp_flowspec_port_classifier, icmp_and_unknown_protocols_are_not_classified) {
+    uint32_t victim_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", victim_ipv4));
+    auto samples = make_gobgp_flowspec_port_samples({ make_gobgp_flowspec_port_sample(victim_ipv4, 1, 443, 100) });
+    auto icmp_result = classify_gobgp_flowspec_destination_port(
+        victim_ipv4, make_gobgp_flowspec_port_attack(static_cast<unsigned int>(ip_protocol_t::ICMP)), samples,
+        make_gobgp_flowspec_port_config(1));
+    auto unknown_result = classify_gobgp_flowspec_destination_port(victim_ipv4, make_gobgp_flowspec_port_attack(99),
+                                                                    samples, make_gobgp_flowspec_port_config(1));
+    EXPECT_FALSE(icmp_result.selected_destination_port.has_value());
+    EXPECT_FALSE(unknown_result.selected_destination_port.has_value());
+    EXPECT_EQ(icmp_result.reason, gobgp_flowspec_port_classifier_reason_t::unsupported_protocol);
+    EXPECT_EQ(unknown_result.reason, gobgp_flowspec_port_classifier_reason_t::unsupported_protocol);
+}
+
+TEST(gobgp_flowspec_port_classifier, zero_port_non_initial_fragments_and_unrelated_packets_are_ignored) {
+    uint32_t victim_ipv4 = 0;
+    uint32_t another_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", victim_ipv4));
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.11", another_ipv4));
+    const unsigned int tcp = static_cast<unsigned int>(ip_protocol_t::TCP);
+    simple_packet_t non_initial_fragment = make_gobgp_flowspec_port_sample(victim_ipv4, tcp, 80, 100);
+    non_initial_fragment.ip_fragmented = true;
+    non_initial_fragment.ip_fragment_offset = 8;
+    auto samples = make_gobgp_flowspec_port_samples({ make_gobgp_flowspec_port_sample(victim_ipv4, tcp, 0, 100),
+                                                       non_initial_fragment,
+                                                       make_gobgp_flowspec_port_sample(another_ipv4, tcp, 22, 100),
+                                                       make_gobgp_flowspec_port_sample(victim_ipv4, tcp, 443, 1) });
+    auto result = classify_gobgp_flowspec_destination_port(victim_ipv4, make_gobgp_flowspec_port_attack(tcp), samples,
+                                                            make_gobgp_flowspec_port_config(1));
+    EXPECT_EQ(result.selected_destination_port, std::optional<uint16_t>(443));
+    EXPECT_EQ(result.qualifying_sample_count, 1U);
+}
+
+TEST(gobgp_flowspec_port_classifier, unrelated_protocol_is_ignored) {
+    uint32_t victim_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", victim_ipv4));
+    const unsigned int tcp = static_cast<unsigned int>(ip_protocol_t::TCP);
+    const unsigned int udp = static_cast<unsigned int>(ip_protocol_t::UDP);
+    auto samples = make_gobgp_flowspec_port_samples({ make_gobgp_flowspec_port_sample(victim_ipv4, udp, 53, 100),
+                                                       make_gobgp_flowspec_port_sample(victim_ipv4, tcp, 443, 1) });
+    auto result = classify_gobgp_flowspec_destination_port(victim_ipv4, make_gobgp_flowspec_port_attack(tcp), samples,
+                                                            make_gobgp_flowspec_port_config(1));
+    EXPECT_EQ(result.selected_destination_port, std::optional<uint16_t>(443));
+    EXPECT_EQ(result.qualifying_sample_count, 1U);
+}
+
+TEST(gobgp_flowspec_port_classifier, sampling_weight_can_change_the_winner) {
+    uint32_t victim_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", victim_ipv4));
+    const unsigned int tcp = static_cast<unsigned int>(ip_protocol_t::TCP);
+    auto samples = make_gobgp_flowspec_port_samples({ make_gobgp_flowspec_port_sample(victim_ipv4, tcp, 443, 100, 1),
+                                                       make_gobgp_flowspec_port_sample(victim_ipv4, tcp, 53, 2, 100) });
+    auto result = classify_gobgp_flowspec_destination_port(victim_ipv4, make_gobgp_flowspec_port_attack(tcp), samples,
+                                                            make_gobgp_flowspec_port_config(2, 60));
+    EXPECT_EQ(result.selected_destination_port, std::optional<uint16_t>(53));
+    EXPECT_EQ(result.dominant_weight, 200U);
+}
+
+TEST(gobgp_flowspec_port_classifier, exact_dominance_threshold_is_selected_and_one_below_is_not) {
+    uint32_t victim_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", victim_ipv4));
+    const unsigned int udp = static_cast<unsigned int>(ip_protocol_t::UDP);
+    auto exact_samples = make_gobgp_flowspec_port_samples({ make_gobgp_flowspec_port_sample(victim_ipv4, udp, 53, 70),
+                                                             make_gobgp_flowspec_port_sample(victim_ipv4, udp, 123, 30) });
+    auto below_samples = make_gobgp_flowspec_port_samples({ make_gobgp_flowspec_port_sample(victim_ipv4, udp, 53, 69),
+                                                             make_gobgp_flowspec_port_sample(victim_ipv4, udp, 123, 31) });
+    auto exact_result = classify_gobgp_flowspec_destination_port(victim_ipv4, make_gobgp_flowspec_port_attack(udp),
+                                                                  exact_samples, make_gobgp_flowspec_port_config());
+    auto below_result = classify_gobgp_flowspec_destination_port(victim_ipv4, make_gobgp_flowspec_port_attack(udp),
+                                                                  below_samples, make_gobgp_flowspec_port_config());
+    EXPECT_EQ(exact_result.selected_destination_port, std::optional<uint16_t>(53));
+    EXPECT_FALSE(below_result.selected_destination_port.has_value());
+    EXPECT_EQ(below_result.reason, gobgp_flowspec_port_classifier_reason_t::below_dominance);
+}
+
+TEST(gobgp_flowspec_port_classifier, outgoing_attacks_are_not_classified) {
+    uint32_t victim_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", victim_ipv4));
+    const unsigned int tcp = static_cast<unsigned int>(ip_protocol_t::TCP);
+    auto samples = make_gobgp_flowspec_port_samples({ make_gobgp_flowspec_port_sample(victim_ipv4, tcp, 443, 100) });
+    auto result = classify_gobgp_flowspec_destination_port(victim_ipv4, make_gobgp_flowspec_port_attack(tcp, OUTGOING),
+                                                            samples, make_gobgp_flowspec_port_config(1));
+    EXPECT_FALSE(result.selected_destination_port.has_value());
+    EXPECT_EQ(result.reason, gobgp_flowspec_port_classifier_reason_t::not_incoming);
 }
 
 /* Patricia tests */
