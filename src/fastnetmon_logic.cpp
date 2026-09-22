@@ -45,6 +45,7 @@
 #ifdef ENABLE_GOBGP
 #include "actions/gobgp_action.hpp"
 #include "actions/gobgp_flowspec_port_classifier.hpp"
+#include "actions/gobgp_flowspec_protocol_admission.hpp"
 #endif
 
 #include "actions/exabgp_action.hpp"
@@ -95,6 +96,9 @@ extern packet_buckets_storage_t<subnet_ipv6_cidr_mask_t> packet_buckets_ipv6_sto
 extern std::string cli_stats_file_path;
 extern unsigned int total_number_of_hosts_in_our_networks;
 extern abstract_subnet_counters_t<subnet_cidr_mask_t, subnet_counter_t> ipv4_network_counters;
+extern abstract_subnet_counters_t<uint32_t, subnet_counter_t> ipv4_host_counters;
+extern blackhole_ban_list_t<uint32_t> ban_list_ipv4;
+extern packet_buckets_storage_t<uint32_t> packet_buckets_ipv4_storage;
 extern unsigned int recalculate_speed_timeout;
 extern bool DEBUG_DUMP_ALL_PACKETS;
 extern bool DEBUG_DUMP_OTHER_PACKETS;
@@ -2713,6 +2717,14 @@ void remove_orphaned_buckets(packet_buckets_storage_t<TemplateKeyType>& packet_s
         // Stop packet collection ASAP
         bucket.we_could_receive_new_data = false;
 
+#ifdef ENABLE_GOBGP
+        if constexpr (std::is_same_v<TemplateKeyType, uint32_t>) {
+            if (bucket.collection_pattern == collection_pattern_t::FLOW_SPEC_REFRESH_ONCE) {
+                gobgp_flowspec_refresh_complete_ipv4_capture(client_ip);
+            }
+        }
+#endif
+
         // Remove it completely from map
         packet_storage.packet_buckets_map.erase(client_ip);
     }
@@ -2774,20 +2786,186 @@ bool get_element_from_map_of_flow_counters(map_of_vector_counters_for_flow_t& ma
     return true;
 }
 
+#ifdef ENABLE_GOBGP
+namespace {
+
+std::map<uint32_t, time_t> gobgp_flowspec_refresh_last_capture_time;
+
+bool get_gobgp_flowspec_protocol_admission_snapshot(
+    uint32_t victim_ipv4,
+    gobgp_flowspec_protocol_admission_snapshot_t& snapshot) {
+    subnet_counter_t current_speed;
+    if (!ipv4_host_counters.get_average_speed(victim_ipv4, current_speed)) {
+        return false;
+    }
+
+    subnet_cidr_mask_t customer_subnet;
+    bool lookup_result =
+        lookup_ip_in_integer_form_inpatricia_and_return_subnet_if_found(lookup_tree_ipv4, victim_ipv4, customer_subnet);
+
+    if (!lookup_result) {
+        logger << log4cpp::Priority::WARN << "GoBGP FlowSpec refresh could not get customer network for "
+               << convert_ip_as_uint_to_string(victim_ipv4);
+    }
+
+    std::string host_group_name;
+    ban_settings_t ban_settings = get_ban_settings_for_this_subnet(customer_subnet, host_group_name);
+
+    snapshot = gobgp_flowspec_protocol_admission_snapshot_t{};
+    snapshot.victim_ipv4 = victim_ipv4;
+    snapshot.host_group_name = host_group_name;
+    snapshot.total_in_pps = current_speed.total.in_packets;
+    snapshot.tcp_in_pps = current_speed.tcp.in_packets;
+    snapshot.udp_in_pps = current_speed.udp.in_packets;
+    snapshot.icmp_in_pps = current_speed.icmp.in_packets;
+    snapshot.tcp_pps_enabled = ban_settings.enable_ban_for_tcp_pps;
+    snapshot.tcp_pps_threshold = ban_settings.ban_threshold_tcp_pps;
+    snapshot.udp_pps_enabled = ban_settings.enable_ban_for_udp_pps;
+    snapshot.udp_pps_threshold = ban_settings.ban_threshold_udp_pps;
+    snapshot.icmp_pps_enabled = ban_settings.enable_ban_for_icmp_pps;
+    snapshot.icmp_pps_threshold = ban_settings.ban_threshold_icmp_pps;
+    return true;
+}
+
+void log_gobgp_flowspec_protocol_admission(const gobgp_flowspec_protocol_admission_snapshot_t& snapshot,
+                                           const std::set<ip_protocol_t>& active_protocols) {
+    const auto active = [&active_protocols](ip_protocol_t protocol) {
+        return active_protocols.count(protocol) != 0 ? "active" : "inactive";
+    };
+
+    logger << log4cpp::Priority::DEBUG << "FlowSpec refresh for "
+           << convert_ip_as_uint_to_string(snapshot.victim_ipv4)
+           << " hostgroup=" << snapshot.host_group_name
+           << " TCP=" << snapshot.tcp_in_pps << "/" << snapshot.tcp_pps_threshold << " " << active(ip_protocol_t::TCP)
+           << " UDP=" << snapshot.udp_in_pps << "/" << snapshot.udp_pps_threshold << " " << active(ip_protocol_t::UDP)
+           << " ICMP=" << snapshot.icmp_in_pps << "/" << snapshot.icmp_pps_threshold << " " << active(ip_protocol_t::ICMP);
+}
+
+void gobgp_flowspec_refresh_process_ipv4_capture(
+    uint32_t victim_ipv4,
+    const boost::circular_buffer<simple_packet_t>& packet_samples) {
+    if (!fastnetmon_global_configuration.gobgp || !fastnetmon_global_configuration.gobgp_flowspec
+        || !fastnetmon_global_configuration.gobgp_flowspec_rule_refresh) {
+        return;
+    }
+
+    gobgp_flowspec_protocol_admission_snapshot_t admission_snapshot;
+    if (!get_gobgp_flowspec_protocol_admission_snapshot(victim_ipv4, admission_snapshot)) {
+        gobgp_flowspec_refresh_complete_ipv4_capture(victim_ipv4);
+        return;
+    }
+
+    std::set<ip_protocol_t> active_protocols = get_gobgp_flowspec_active_protocols(admission_snapshot);
+    log_gobgp_flowspec_protocol_admission(admission_snapshot, active_protocols);
+
+    if (active_protocols.empty()) {
+        gobgp_flowspec_refresh_complete_ipv4_capture(victim_ipv4);
+        return;
+    }
+
+    if (!fastnetmon_global_configuration.gobgp_flowspec_port_detection) {
+        active_protocols.erase(ip_protocol_t::TCP);
+        active_protocols.erase(ip_protocol_t::UDP);
+    }
+
+    const gobgp_flowspec_port_classifier_config_t classifier_config = {
+        fastnetmon_global_configuration.gobgp_flowspec_port_min_samples,
+        fastnetmon_global_configuration.gobgp_flowspec_port_dominance_percent,
+    };
+
+    const auto protocol_results = classify_gobgp_flowspec_refresh_protocols(
+        victim_ipv4, active_protocols, packet_samples, classifier_config,
+        fastnetmon_global_configuration.gobgp_flowspec_refresh_port_min_share_percent);
+
+    if (!protocol_results.empty()) {
+        gobgp_flowspec_refresh_manage_ipv4(victim_ipv4, protocol_results);
+    } else {
+        gobgp_flowspec_refresh_complete_ipv4_capture(victim_ipv4);
+    }
+}
+
+void schedule_gobgp_flowspec_refresh_captures() {
+    if (!fastnetmon_global_configuration.gobgp || !fastnetmon_global_configuration.gobgp_flowspec
+        || !fastnetmon_global_configuration.gobgp_flowspec_rule_refresh) {
+        return;
+    }
+
+    time_t current_time = 0;
+    time(&current_time);
+
+    std::map<uint32_t, attack_details_t> active_bans;
+    ban_list_ipv4.get_whole_banlist(active_bans);
+
+    for (auto iterator = gobgp_flowspec_refresh_last_capture_time.begin();
+         iterator != gobgp_flowspec_refresh_last_capture_time.end();) {
+        if (active_bans.count(iterator->first) == 0) {
+            iterator = gobgp_flowspec_refresh_last_capture_time.erase(iterator);
+        } else {
+            ++iterator;
+        }
+    }
+
+    for (const auto& [victim_ipv4, ban_details] : active_bans) {
+        (void)ban_details;
+
+        const auto last_capture_iterator = gobgp_flowspec_refresh_last_capture_time.find(victim_ipv4);
+        if (last_capture_iterator != gobgp_flowspec_refresh_last_capture_time.end()
+            && static_cast<uint64_t>(difftime(current_time, last_capture_iterator->second))
+                   < fastnetmon_global_configuration.gobgp_flowspec_rule_refresh_interval) {
+            continue;
+        }
+
+        if (packet_buckets_ipv4_storage.we_have_bucket_for_this_ip(victim_ipv4)) {
+            continue;
+        }
+
+        gobgp_flowspec_protocol_admission_snapshot_t admission_snapshot;
+        if (!get_gobgp_flowspec_protocol_admission_snapshot(victim_ipv4, admission_snapshot)) {
+            continue;
+        }
+
+        const std::set<ip_protocol_t> active_protocols = get_gobgp_flowspec_active_protocols(admission_snapshot);
+        if (active_protocols.empty()) {
+            continue;
+        }
+
+        if (!gobgp_flowspec_refresh_begin_ipv4_capture(victim_ipv4)) {
+            continue;
+        }
+
+        if (packet_buckets_ipv4_storage.enable_packet_capture(
+                victim_ipv4, ban_details, collection_pattern_t::FLOW_SPEC_REFRESH_ONCE)) {
+            gobgp_flowspec_refresh_last_capture_time[victim_ipv4] = current_time;
+            logger << log4cpp::Priority::DEBUG << "FlowSpec refresh capture scheduled for "
+                   << convert_ip_as_uint_to_string(victim_ipv4);
+        } else {
+            gobgp_flowspec_refresh_complete_ipv4_capture(victim_ipv4);
+        }
+    }
+}
+
+} // namespace
+#endif
+
 void process_filled_buckets_ipv4() {
     extern packet_buckets_storage_t<uint32_t> packet_buckets_ipv4_storage;
     extern map_of_vector_counters_for_flow_t SubnetVectorMapFlow;
 
     std::vector<uint32_t> filled_buckets;
 
+#ifdef ENABLE_GOBGP
+    std::vector<std::pair<uint32_t, boost::circular_buffer<simple_packet_t>>> refresh_buckets;
+#endif
+
     // TODO: amount of processing we do under lock is absolutely insane
     // We need to rework it
+    {
     std::lock_guard<std::mutex> lock_guard(packet_buckets_ipv4_storage.packet_buckets_map_mutex);
 
     for (auto itr = packet_buckets_ipv4_storage.packet_buckets_map.begin();
          itr != packet_buckets_ipv4_storage.packet_buckets_map.end(); ++itr) {
         // Find one time capture requests which filled completely
-        if (itr->second.collection_pattern == collection_pattern_t::ONCE &&
+        if (is_one_shot_collection_pattern(itr->second.collection_pattern) &&
             itr->second.we_collected_full_buffer_least_once && !itr->second.is_already_processed) {
 
             logger << log4cpp::Priority::DEBUG << "Found filled bucket for IPv4 " << convert_any_ip_to_string(itr->first);
@@ -2802,6 +2980,15 @@ void process_filled_buckets_ipv4() {
         std::string client_ip_as_string = convert_ip_as_uint_to_string(client_ip_as_integer);
 
         packet_bucket_t& bucket = packet_buckets_ipv4_storage.packet_buckets_map[client_ip_as_integer];
+
+#ifdef ENABLE_GOBGP
+        if (bucket.collection_pattern == collection_pattern_t::FLOW_SPEC_REFRESH_ONCE) {
+            refresh_buckets.emplace_back(client_ip_as_integer, bucket.parsed_packets_circular_buffer);
+            bucket.we_could_receive_new_data = false;
+            packet_buckets_ipv4_storage.packet_buckets_map.erase(client_ip_as_integer);
+            continue;
+        }
+#endif
 
         // We found something, let's do processing
         logger << log4cpp::Priority::INFO << "We've got new completely filled bucket with packets for IP " << client_ip_as_string;
@@ -2838,6 +3025,13 @@ void process_filled_buckets_ipv4() {
         // Remove it completely from map
         packet_buckets_ipv4_storage.packet_buckets_map.erase(client_ip_as_integer);
     }
+    }
+
+#ifdef ENABLE_GOBGP
+    for (const auto& [client_ip, packet_samples] : refresh_buckets) {
+        gobgp_flowspec_refresh_process_ipv4_capture(client_ip, packet_samples);
+    }
+#endif
 }
 
 
@@ -2898,6 +3092,10 @@ void check_traffic_buckets() {
 
         process_filled_buckets_ipv4();
 
+#ifdef ENABLE_GOBGP
+        schedule_gobgp_flowspec_refresh_captures();
+#endif
+
         process_filled_buckets_ipv6();
 
         boost::this_thread::sleep(boost::posix_time::seconds(check_for_availible_for_processing_packets_buckets));
@@ -2910,7 +3108,7 @@ bool should_remove_orphaned_bucket(const std::pair<TemplatedKeyType, packet_buck
     logger << log4cpp::Priority::DEBUG << "Process bucket for " << convert_any_ip_to_string(pair.first);
 
     // We process only "once" buckets
-    if (pair.second.collection_pattern != collection_pattern_t::ONCE) {
+    if (!is_one_shot_collection_pattern(pair.second.collection_pattern)) {
         logger << log4cpp::Priority::DEBUG << "We do not cleanup buckets with non-once collection pattern "
                << convert_any_ip_to_string(pair.first);
         return false;

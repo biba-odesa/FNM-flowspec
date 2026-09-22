@@ -19,6 +19,41 @@ This is not an official FastNetMon release and is not endorsed by or affiliated 
 
 This fork retains the original licensing and copyright notices. Applicable terms are available in [LICENSE](LICENSE) and the upstream [FastNetMon Community Edition Terms and Conditions](https://fastnetmon.com/fastnetmon-community-edition-terms-and-conditions/).
 
+FNM-flowspec / GoBGP IPv4 FlowSpec
+-----------------------------------
+This fork adds dynamic IPv4 FlowSpec mitigation for deployments using the following path:
+
+```text
+FastNetMon -> GoBGP gRPC API -> BGP FlowSpec-capable routers
+```
+
+FlowSpec is intended to complement the existing RTBH and ExaBGP mechanisms. FastNetMon creates and withdraws FlowSpec paths dynamically through GoBGP's gRPC API. The UUID returned by GoBGP AddPath is retained in memory and used for the exact DeletePath withdrawal.
+
+Supported IPv4 matches are destination-only, TCP/UDP/ICMP protocol-only, and TCP/UDP destination-port rules. During the initial BAN, TCP and UDP use dominant destination-port classification; the default weighted dominance threshold is 70%. While a victim remains banned, optional active refresh uses current protocol PPS admission plus a fresh packet capture. It can add multiple significant TCP or UDP ports, each at the default 20% weighted sample share.
+
+Port-specific rules are limited independently for each victim and protocol. The default maximum is four TCP ports and four UDP ports. If newly significant ports would exceed that limit, FastNetMon first installs a protocol-only rule, waits for successful GoBGP AddPath, then removes redundant port-specific rules. A failed protocol-only AddPath leaves the existing port rules in place. TCP and UDP lifecycles are independent; ICMP remains protocol-only. UNBAN withdraws all FlowSpec paths for the victim.
+
+The values 70%, 20%, and four are defaults and can be changed in `fastnetmon.conf`:
+
+```ini
+gobgp = on
+gobgp_flowspec = on
+gobgp_flowspec_redirect_ipv4 = 172.66.66.1
+
+gobgp_flowspec_port_detection = on
+gobgp_flowspec_port_min_samples = 10
+gobgp_flowspec_port_dominance_percent = 70
+
+gobgp_flowspec_rule_refresh = on
+gobgp_flowspec_rule_refresh_interval = 5
+gobgp_flowspec_refresh_port_min_share_percent = 20
+gobgp_flowspec_max_port_rules_per_protocol = 4
+```
+
+`172.66.66.1` is only an example redirect IPv4 address; configure the address of the appropriate scrubber or test target for your network. `gobgp_flowspec_port_detection` enables TCP/UDP port analysis, `gobgp_flowspec_port_min_samples` sets the minimum trusted sample count, and `gobgp_flowspec_port_dominance_percent` controls initial dominant-port selection. `gobgp_flowspec_rule_refresh` and its interval enable refresh while a victim remains banned. `gobgp_flowspec_refresh_port_min_share_percent` controls additional refresh ports, while `gobgp_flowspec_max_port_rules_per_protocol` controls escalation to a protocol-only rule.
+
+For operational safety, first test FlowSpec against a peer or router policy that accepts and observes generated NLRI without installing a forwarding action. Enable redirect actions only after validating the generated rules and router policy.
+
 Project 
 -------
 🌏️ [Official site](https://fastnetmon.com)  

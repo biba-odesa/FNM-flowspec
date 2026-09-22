@@ -8,7 +8,15 @@ extern log4cpp::Category& logger;
 enum class collection_pattern_t {
     // Just fill whole buffer one time and stop collection process
     ONCE = 1,
+
+    // A one-shot capture used only to refresh GoBGP FlowSpec rules for an already banned IPv4 host.
+    FLOW_SPEC_REFRESH_ONCE = 2,
 };
+
+inline bool is_one_shot_collection_pattern(collection_pattern_t collection_pattern) {
+    return collection_pattern == collection_pattern_t::ONCE
+           || collection_pattern == collection_pattern_t::FLOW_SPEC_REFRESH_ONCE;
+}
 
 // In this class we are storing circular buffers with full packet payloads and with parsed packet details
 class packet_bucket_t {
@@ -179,7 +187,7 @@ template <typename TemplateKeyType> class packet_buckets_storage_t {
         }
 
         // if we are near to overflow for one from two buffers just switch off collection
-        if (itr->second.collection_pattern == collection_pattern_t::ONCE) {
+        if (is_one_shot_collection_pattern(itr->second.collection_pattern)) {
 
             if (itr->second.parsed_packets_circular_buffer.size() + 1 == itr->second.parsed_packets_circular_buffer.capacity() ||
                 itr->second.raw_packets_circular_buffer.size() + 1 == itr->second.raw_packets_circular_buffer.capacity()) {

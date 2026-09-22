@@ -622,6 +622,7 @@ add_library(gobgp_flowspec_rule_builder STATIC actions/gobgp_flowspec_rule_build
 add_library(gobgp_flowspec_lifecycle STATIC actions/gobgp_flowspec_lifecycle.cpp)
 add_library(gobgp_log_formatter STATIC actions/gobgp_log_formatter.cpp)
 add_library(gobgp_flowspec_port_classifier STATIC actions/gobgp_flowspec_port_classifier.cpp)
+add_library(gobgp_flowspec_protocol_admission STATIC actions/gobgp_flowspec_protocol_admission.cpp)
 add_library(gobgp_flowspec_notification_formatter STATIC actions/gobgp_flowspec_notification_formatter.cpp)
 
 if (LINK_WITH_ABSL)
@@ -1038,6 +1039,7 @@ target_link_libraries(fastnetmon ipfix_rfc)
 
 target_link_libraries(fastnetmon_logic filter bgp_protocol bgp_protocol_flow_spec exabgp_action)
 target_link_libraries(fastnetmon_logic gobgp_flowspec_port_classifier)
+target_link_libraries(fastnetmon_logic gobgp_flowspec_protocol_admission)
 
 target_link_libraries(fastnetmon_logic protobuf_traffic_format)
 
@@ -1133,6 +1135,7 @@ if (BUILD_TESTS)
     target_link_libraries(fastnetmon_tests gobgp_flowspec_lifecycle)
     target_link_libraries(fastnetmon_tests gobgp_log_formatter)
     target_link_libraries(fastnetmon_tests gobgp_flowspec_port_classifier)
+    target_link_libraries(fastnetmon_tests gobgp_flowspec_protocol_admission)
     target_link_libraries(fastnetmon_tests gobgp_flowspec_notification_formatter)
     target_link_libraries(fastnetmon_tests ${CMAKE_THREAD_LIBS_INIT})
     target_link_libraries(fastnetmon_tests ${Boost_LIBRARIES})

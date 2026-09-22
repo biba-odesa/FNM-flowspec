@@ -6,6 +6,7 @@
 
 #include <string>
 #include <optional>
+#include <vector>
 
 void gobgp_action_init();
 void gobgp_action_shutdown();
@@ -16,3 +17,8 @@ void gobgp_ban_manage(const std::string& action,
                       const attack_details_t& current_attack,
                       std::optional<uint16_t> selected_destination_port = std::nullopt,
                       std::optional<gobgp_flowspec_port_classifier_result_t> classifier_result = std::nullopt);
+
+void gobgp_flowspec_refresh_manage_ipv4(uint32_t client_ip,
+                                        const std::vector<gobgp_flowspec_refresh_protocol_result_t>& protocol_results);
+bool gobgp_flowspec_refresh_begin_ipv4_capture(uint32_t client_ip);
+void gobgp_flowspec_refresh_complete_ipv4_capture(uint32_t client_ip);

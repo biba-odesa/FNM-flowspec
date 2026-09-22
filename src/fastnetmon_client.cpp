@@ -20,6 +20,23 @@ std::string cli_stats_ipv4_file_path = "/tmp/fastnetmon.dat";
 
 std::string cli_stats_ipv6_file_path = "/tmp/fastnetmon_ipv6.dat";
 
+std::string format_fastnetmon_client_header(const std::string& header) {
+    const std::string upstream_prefix = "FastNetMon ";
+    const std::string advanced_edition_suffix = " Try Advanced edition: https://fastnetmon.com/product-overview/";
+
+    if (header.rfind(upstream_prefix, 0) != 0) {
+        return header;
+    }
+
+    const size_t suffix_position = header.find(advanced_edition_suffix, upstream_prefix.size());
+    if (suffix_position == std::string::npos) {
+        return header;
+    }
+
+    return "FastNetMon Biba Edition "
+           + header.substr(upstream_prefix.size(), suffix_position - upstream_prefix.size());
+}
+
 int main(int argc, char** argv) {
     bool ipv6_mode = false;
 
@@ -103,7 +120,14 @@ int main(int argc, char** argv) {
 
         std::string line = "";
         std::stringstream screen_buffer;
+        bool first_line = true;
         while (getline(reading_file, line)) {
+            if (first_line) {
+                screen_buffer << format_fastnetmon_client_header(line) << "\n";
+                first_line = false;
+                continue;
+            }
+
             screen_buffer << line << "\n";
         }
 

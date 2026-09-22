@@ -66,6 +66,10 @@ class fastnetmon_configuration_t {
     uint64_t gobgp_flowspec_port_min_samples{ 10 };
     uint8_t gobgp_flowspec_port_dominance_percent{ 70 };
     std::string gobgp_flowspec_notify_script_path;
+    bool gobgp_flowspec_rule_refresh{ false };
+    uint64_t gobgp_flowspec_rule_refresh_interval{ 5 };
+    uint8_t gobgp_flowspec_refresh_port_min_share_percent{ 20 };
+    uint64_t gobgp_flowspec_max_port_rules_per_protocol{ 4 };
 
     // IPv4
     bool gobgp_announce_host{ false };

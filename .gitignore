@@ -1,6 +1,8 @@
 *.pyc
 __pycache__
 *.DS_Store
+/build-*/
+src/fast_platform.hpp
 src/build/
 src/gobgp_client/attribute.pb.cc
 src/gobgp_client/attribute.pb.h

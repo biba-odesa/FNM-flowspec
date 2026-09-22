@@ -111,21 +111,24 @@ void withdraw_gobgp_flowspec_ipv4_rule(GrpcClient& gobgp_client,
 void announce_gobgp_flowspec_ipv4_rule(GrpcClient& gobgp_client,
                                        const gobgp_flowspec_rule_key_t& rule_key,
                                        const flow_spec_rule_t& flow_spec_rule,
-                                       const std::optional<gobgp_flowspec_port_classifier_result_t>& classifier_result) {
+                                       const std::optional<gobgp_flowspec_port_classifier_result_t>& classifier_result,
+                                       bool is_refresh = false,
+                                       bool cleanup_redundant_ports_after_success = false) {
     const std::string rule_details = format_gobgp_flowspec_rule(flow_spec_rule);
+    const char* operation_prefix = is_refresh ? "GoBGP FlowSpec refresh" : "GoBGP FlowSpec";
 
-    logger << log4cpp::Priority::INFO << "GoBGP FlowSpec ADD attempt " << rule_details;
+    logger << log4cpp::Priority::INFO << operation_prefix << " ADD attempt " << rule_details;
 
     std::string add_path_uuid;
     if (!gobgp_client.AnnounceFlowSpecIPv4(flow_spec_rule, add_path_uuid)) {
         gobgp_flowspec_lifecycle.fail_announce(rule_key);
-        logger << log4cpp::Priority::ERROR << "GoBGP FlowSpec ADD failed " << rule_details;
+        logger << log4cpp::Priority::ERROR << operation_prefix << " ADD failed " << rule_details;
         return;
     }
 
     if (add_path_uuid.empty()) {
         gobgp_flowspec_lifecycle.fail_announce(rule_key);
-        logger << log4cpp::Priority::ERROR << "GoBGP FlowSpec ADD failed " << rule_details
+        logger << log4cpp::Priority::ERROR << operation_prefix << " ADD failed " << rule_details
                << " because GoBGP returned an empty AddPath UUID";
         return;
     }
@@ -137,12 +140,25 @@ void announce_gobgp_flowspec_ipv4_rule(GrpcClient& gobgp_client,
     const std::string uuid_details = format_gobgp_uuid_as_hex(add_path_uuid);
 
     if (completion == gobgp_flowspec_announce_completion_t::installed) {
-        logger << log4cpp::Priority::INFO << "GoBGP FlowSpec ADD success " << rule_details << " " << uuid_details;
+        logger << log4cpp::Priority::INFO << operation_prefix << " ADD success " << rule_details << " " << uuid_details;
+
+        if (cleanup_redundant_ports_after_success) {
+            logger << log4cpp::Priority::INFO << "GoBGP FlowSpec protocol-only escalation success " << rule_details;
+            // Do not withdraw narrower rules until GoBGP has confirmed the covering protocol-only path.
+            const auto cleanup_requests = gobgp_flowspec_lifecycle.begin_protocol_only_escalation_cleanup(rule_key);
+
+            for (const auto& cleanup_request : cleanup_requests) {
+                logger << log4cpp::Priority::INFO << "GoBGP FlowSpec protocol-only escalation cleanup "
+                       << format_gobgp_flowspec_rule(cleanup_request.flow_spec_rule);
+                withdraw_gobgp_flowspec_ipv4_rule(gobgp_client, cleanup_request);
+            }
+        }
+
         return;
     }
 
     if (completion == gobgp_flowspec_announce_completion_t::withdraw_required) {
-        logger << log4cpp::Priority::INFO << "GoBGP FlowSpec ADD success " << rule_details << " " << uuid_details;
+        logger << log4cpp::Priority::INFO << operation_prefix << " ADD success " << rule_details << " " << uuid_details;
         logger << log4cpp::Priority::INFO << "GoBGP FlowSpec DELETE requested while ADD was in progress " << rule_details
                << " " << uuid_details;
 
@@ -280,6 +296,11 @@ void gobgp_action_init() {
             configuration_map["gobgp_flowspec_port_detection"] == "on";
     }
 
+    if (configuration_map.count("gobgp_flowspec_rule_refresh")) {
+        fastnetmon_global_configuration.gobgp_flowspec_rule_refresh =
+            configuration_map["gobgp_flowspec_rule_refresh"] == "on";
+    }
+
     if (fastnetmon_global_configuration.gobgp_flowspec) {
         uint32_t redirect_ipv4 = 0;
 
@@ -314,6 +335,45 @@ void gobgp_action_init() {
             fastnetmon_global_configuration.gobgp_flowspec_port_dominance_percent =
                 static_cast<uint8_t>(parsed_value);
         }
+
+        if (configuration_map.count("gobgp_flowspec_refresh_port_min_share_percent")
+            && !parse_positive_gobgp_flowspec_option("gobgp_flowspec_refresh_port_min_share_percent",
+                                                      configuration_map["gobgp_flowspec_refresh_port_min_share_percent"],
+                                                      100, parsed_value)) {
+            exit(1);
+        }
+
+        if (configuration_map.count("gobgp_flowspec_refresh_port_min_share_percent")) {
+            fastnetmon_global_configuration.gobgp_flowspec_refresh_port_min_share_percent =
+                static_cast<uint8_t>(parsed_value);
+        }
+
+        if (configuration_map.count("gobgp_flowspec_max_port_rules_per_protocol")
+            && !parse_positive_gobgp_flowspec_option("gobgp_flowspec_max_port_rules_per_protocol",
+                                                      configuration_map["gobgp_flowspec_max_port_rules_per_protocol"],
+                                                      std::numeric_limits<uint64_t>::max(), parsed_value)) {
+            exit(1);
+        }
+
+        if (configuration_map.count("gobgp_flowspec_max_port_rules_per_protocol")) {
+            fastnetmon_global_configuration.gobgp_flowspec_max_port_rules_per_protocol = parsed_value;
+        }
+
+        if (fastnetmon_global_configuration.gobgp_flowspec_rule_refresh) {
+            if (configuration_map.count("gobgp_flowspec_rule_refresh_interval")
+                && !parse_positive_gobgp_flowspec_option("gobgp_flowspec_rule_refresh_interval",
+                                                          configuration_map["gobgp_flowspec_rule_refresh_interval"],
+                                                          std::numeric_limits<uint64_t>::max(), parsed_value)) {
+                exit(1);
+            }
+
+            if (configuration_map.count("gobgp_flowspec_rule_refresh_interval")) {
+                fastnetmon_global_configuration.gobgp_flowspec_rule_refresh_interval = parsed_value;
+            }
+        }
+    } else if (fastnetmon_global_configuration.gobgp_flowspec_rule_refresh) {
+        logger << log4cpp::Priority::ERROR << "Configuration error: gobgp_flowspec_rule_refresh=on requires gobgp_flowspec=on";
+        exit(1);
     }
 }
 
@@ -590,4 +650,122 @@ void gobgp_ban_manage(const std::string& action,
         gobgp_ban_manage_ipv4(gobgp_client, client_ip, is_withdrawal, current_attack, selected_destination_port,
                                classifier_result);
     }
+}
+
+void gobgp_flowspec_refresh_manage_ipv4(
+    uint32_t client_ip,
+    const std::vector<gobgp_flowspec_refresh_protocol_result_t>& protocol_results) {
+    if (!fastnetmon_global_configuration.gobgp || !fastnetmon_global_configuration.gobgp_flowspec
+        || !fastnetmon_global_configuration.gobgp_flowspec_rule_refresh || protocol_results.empty()) {
+        gobgp_flowspec_lifecycle.finish_refresh_capture(client_ip);
+        return;
+    }
+
+    boost::thread refresh_thread([client_ip, protocol_results]() {
+        uint32_t redirect_ipv4 = 0;
+        if (!convert_ip_as_string_to_uint_safe(fastnetmon_global_configuration.gobgp_flowspec_redirect_ipv4, redirect_ipv4)
+            || redirect_ipv4 == 0) {
+            logger << log4cpp::Priority::ERROR << "GoBGP FlowSpec refresh ADD failed because configured redirect IPv4 is invalid";
+            gobgp_flowspec_lifecycle.finish_refresh_capture(client_ip);
+            return;
+        }
+
+        GrpcClient gobgp_client = GrpcClient(grpc::CreateChannel("localhost:50051", grpc::InsecureChannelCredentials()));
+
+        for (const auto& protocol_result : protocol_results) {
+            attack_details_t current_attack;
+            current_attack.attack_direction = INCOMING;
+            current_attack.attack_protocol = static_cast<unsigned int>(protocol_result.protocol);
+
+            flow_spec_rule_t protocol_only_rule =
+                build_gobgp_flowspec_ipv4_rule(client_ip, current_attack, redirect_ipv4, std::nullopt);
+            gobgp_flowspec_rule_key_t protocol_only_key;
+
+            if (!build_gobgp_flowspec_rule_key(protocol_only_rule, protocol_only_key)) {
+                logger << log4cpp::Priority::ERROR << "GoBGP FlowSpec refresh ADD failed because the generated rule has an invalid identity "
+                       << format_gobgp_flowspec_rule(protocol_only_rule);
+                continue;
+            }
+
+            if (protocol_result.protocol == ip_protocol_t::ICMP) {
+                if (!gobgp_flowspec_lifecycle.begin_refresh_announce(protocol_only_key, protocol_only_rule)) {
+                    logger << log4cpp::Priority::INFO << "GoBGP FlowSpec refresh ADD skipped because the rule is already active or UNBAN is in progress "
+                           << format_gobgp_flowspec_rule(protocol_only_rule);
+                    continue;
+                }
+
+                announce_gobgp_flowspec_ipv4_rule(gobgp_client, protocol_only_key, protocol_only_rule, std::nullopt, true);
+                continue;
+            }
+
+            std::vector<gobgp_flowspec_announce_request_t> port_rule_requests;
+            for (const auto& candidate : protocol_result.significant_ports) {
+                flow_spec_rule_t port_rule = build_gobgp_flowspec_ipv4_rule(
+                    client_ip, current_attack, redirect_ipv4, candidate.destination_port);
+                gobgp_flowspec_rule_key_t port_rule_key;
+
+                if (!build_gobgp_flowspec_rule_key(port_rule, port_rule_key)) {
+                    logger << log4cpp::Priority::ERROR << "GoBGP FlowSpec refresh ADD failed because the generated rule has an invalid identity "
+                           << format_gobgp_flowspec_rule(port_rule);
+                    continue;
+                }
+
+                logger << log4cpp::Priority::INFO << "FlowSpec refresh significant port: "
+                       << format_gobgp_flowspec_rule(port_rule) << " share="
+                       << static_cast<unsigned int>(candidate.port_share_percent) << "%";
+                port_rule_requests.push_back({ port_rule_key, port_rule });
+            }
+
+            const auto plan = gobgp_flowspec_lifecycle.begin_refresh_protocol_rules(
+                { protocol_only_key, protocol_only_rule }, port_rule_requests,
+                fastnetmon_global_configuration.gobgp_flowspec_max_port_rules_per_protocol);
+
+            const char* action_name = "no_new_ports";
+            switch (plan.action) {
+            case gobgp_flowspec_refresh_protocol_action_t::add_port_rules:
+                action_name = "add_ports";
+                break;
+            case gobgp_flowspec_refresh_protocol_action_t::escalate_protocol_only:
+                action_name = "escalate_protocol_only";
+                break;
+            case gobgp_flowspec_refresh_protocol_action_t::protocol_only_covers:
+                action_name = "protocol_only_covers";
+                break;
+            case gobgp_flowspec_refresh_protocol_action_t::withdraw_in_progress:
+                action_name = "withdraw_in_progress";
+                break;
+            case gobgp_flowspec_refresh_protocol_action_t::no_new_port_rules:
+                break;
+            }
+
+            logger << log4cpp::Priority::INFO << "FlowSpec refresh decision: dst="
+                   << convert_ip_as_uint_to_string(client_ip) << "/32 protocol="
+                   << get_ip_protocol_name(protocol_result.protocol)
+                   << " samples=" << protocol_result.qualifying_sample_count
+                   << " min_share="
+                   << static_cast<unsigned int>(fastnetmon_global_configuration.gobgp_flowspec_refresh_port_min_share_percent)
+                   << "% reason=" << get_gobgp_flowspec_port_classifier_reason_name(protocol_result.reason)
+                   << " existing_ports=" << plan.existing_port_rule_count
+                   << " new_ports=" << plan.new_port_rule_count
+                   << " max_ports=" << fastnetmon_global_configuration.gobgp_flowspec_max_port_rules_per_protocol
+                   << " action=" << action_name;
+
+            const bool is_escalation = plan.action == gobgp_flowspec_refresh_protocol_action_t::escalate_protocol_only;
+            for (const auto& announce_request : plan.announce_requests) {
+                announce_gobgp_flowspec_ipv4_rule(gobgp_client, announce_request.rule_key,
+                                                   announce_request.flow_spec_rule, std::nullopt, true, is_escalation);
+            }
+        }
+
+        gobgp_flowspec_lifecycle.finish_refresh_capture(client_ip);
+    });
+    refresh_thread.detach();
+}
+
+bool gobgp_flowspec_refresh_begin_ipv4_capture(uint32_t client_ip) {
+    return gobgp_flowspec_lifecycle.begin_refresh_capture(client_ip);
+}
+
+void gobgp_flowspec_refresh_complete_ipv4_capture(uint32_t client_ip) {
+    gobgp_flowspec_lifecycle.finish_refresh_capture(client_ip);
 }
