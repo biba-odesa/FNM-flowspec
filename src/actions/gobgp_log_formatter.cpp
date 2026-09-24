@@ -77,13 +77,17 @@ std::string format_gobgp_flowspec_rule(const flow_spec_rule_t& flow_spec_rule) {
         });
     }
 
-    buffer << " redirect=";
-    if (flow_spec_rule.ipv4_nexthops.empty()) {
-        buffer << "<missing>";
+    if (flow_spec_rule.get_action().get_type() == bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_DISCARD) {
+        buffer << " action=discard";
     } else {
-        buffer << format_value_list<uint32_t>(flow_spec_rule.ipv4_nexthops, [](uint32_t next_hop) {
-            return convert_ip_as_uint_to_string(next_hop);
-        });
+        buffer << " redirect=";
+        if (flow_spec_rule.ipv4_nexthops.empty()) {
+            buffer << "<missing>";
+        } else {
+            buffer << format_value_list<uint32_t>(flow_spec_rule.ipv4_nexthops, [](uint32_t next_hop) {
+                return convert_ip_as_uint_to_string(next_hop);
+            });
+        }
     }
 
     return buffer.str();

@@ -564,6 +564,128 @@ TEST(flowspec, gobgp_static_redirect_ipv4_destination_only_wire_encoding) {
               0);
 }
 
+TEST(flowspec, gobgp_static_discard_ipv4_wire_encoding) {
+    uint32_t destination_ip = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", destination_ip));
+
+    flow_spec_rule_t flow_spec_rule;
+    flow_spec_rule.set_destination_subnet_ipv4(subnet_cidr_mask_t(destination_ip, 32));
+    flow_spec_rule.add_protocol(ip_protocol_t::TCP);
+    flow_spec_rule.add_destination_port(443);
+
+    bgp_flow_spec_action_t discard_action;
+    discard_action.set_type(bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_DISCARD);
+    flow_spec_rule.set_action(discard_action);
+
+    EXPECT_TRUE(flow_spec_rule.ipv4_nexthops.empty());
+
+    std::vector<dynamic_binary_buffer_t> attributes = build_attributes_for_gobgp_flowspec_announce(flow_spec_rule);
+    ASSERT_EQ(attributes.size(), 3U);
+
+    const std::array<uint8_t, 4> expected_origin = { 0x40, 0x01, 0x01, 0x02 };
+    const std::array<uint8_t, 7> expected_next_hop_carrier = { 0x40, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00 };
+    const std::array<uint8_t, 11> expected_discard_extended_community = {
+        0xc0, 0x10, 0x08, 0x80, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+
+    ASSERT_EQ(attributes[0].get_used_size(), expected_origin.size());
+    EXPECT_EQ(memcmp(attributes[0].get_pointer(), expected_origin.data(), expected_origin.size()), 0);
+    ASSERT_EQ(attributes[1].get_used_size(), expected_next_hop_carrier.size());
+    EXPECT_EQ(memcmp(attributes[1].get_pointer(), expected_next_hop_carrier.data(), expected_next_hop_carrier.size()), 0);
+    ASSERT_EQ(attributes[2].get_used_size(), expected_discard_extended_community.size());
+    EXPECT_EQ(memcmp(attributes[2].get_pointer(), expected_discard_extended_community.data(),
+                     expected_discard_extended_community.size()),
+              0);
+}
+
+TEST(gobgp_flowspec_rule_builder, default_and_explicit_redirect_actions_are_backward_compatible) {
+    uint32_t victim_ipv4 = 0;
+    uint32_t redirect_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", victim_ipv4));
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("192.168.100.50", redirect_ipv4));
+
+    attack_details_t current_attack = make_gobgp_flowspec_port_attack(static_cast<unsigned int>(ip_protocol_t::TCP));
+    const flow_spec_rule_t default_rule = build_gobgp_flowspec_ipv4_rule(victim_ipv4, current_attack, redirect_ipv4, 443);
+    const flow_spec_rule_t explicit_rule = build_gobgp_flowspec_ipv4_rule(
+        victim_ipv4, current_attack, redirect_ipv4, 443, bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_REDIRECT);
+
+    EXPECT_EQ(default_rule.get_action().get_type(), bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_REDIRECT);
+    EXPECT_EQ(explicit_rule.get_action().get_type(), bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_REDIRECT);
+    EXPECT_EQ(default_rule.ipv4_nexthops, std::vector<uint32_t>{ redirect_ipv4 });
+    EXPECT_EQ(explicit_rule.ipv4_nexthops, std::vector<uint32_t>{ redirect_ipv4 });
+    EXPECT_EQ(build_attributes_for_gobgp_flowspec_announce(default_rule).size(), 3U);
+    EXPECT_EQ(build_attributes_for_gobgp_flowspec_announce(explicit_rule).size(), 3U);
+}
+
+TEST(gobgp_flowspec_rule_builder, discard_rules_do_not_include_redirect_ipv4) {
+    uint32_t victim_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", victim_ipv4));
+
+    const auto discard = bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_DISCARD;
+    const attack_details_t tcp_attack = make_gobgp_flowspec_port_attack(static_cast<unsigned int>(ip_protocol_t::TCP));
+    const attack_details_t udp_attack = make_gobgp_flowspec_port_attack(static_cast<unsigned int>(ip_protocol_t::UDP));
+    const attack_details_t icmp_attack = make_gobgp_flowspec_port_attack(static_cast<unsigned int>(ip_protocol_t::ICMP));
+
+    const flow_spec_rule_t tcp_rule = build_gobgp_flowspec_ipv4_rule(victim_ipv4, tcp_attack, 0, 443, discard);
+    const flow_spec_rule_t udp_rule = build_gobgp_flowspec_ipv4_rule(victim_ipv4, udp_attack, 0, 53, discard);
+    const flow_spec_rule_t icmp_rule = build_gobgp_flowspec_ipv4_rule(victim_ipv4, icmp_attack, 0, std::nullopt, discard);
+
+    EXPECT_EQ(tcp_rule.destination_ports, std::vector<uint16_t>{ 443 });
+    EXPECT_EQ(udp_rule.destination_ports, std::vector<uint16_t>{ 53 });
+    EXPECT_TRUE(icmp_rule.destination_ports.empty());
+
+    for (const flow_spec_rule_t* rule : { &tcp_rule, &udp_rule, &icmp_rule }) {
+        EXPECT_EQ(rule->get_action().get_type(), discard);
+        EXPECT_TRUE(rule->ipv4_nexthops.empty());
+        EXPECT_NE(format_gobgp_flowspec_rule(*rule).find("action=discard"), std::string::npos);
+        EXPECT_EQ(format_gobgp_flowspec_rule(*rule).find("redirect="), std::string::npos);
+        EXPECT_EQ(build_attributes_for_gobgp_flowspec_announce(*rule).size(), 3U);
+    }
+}
+
+TEST(gobgp_flowspec_rule_builder, validates_configured_action_names) {
+    bgp_flow_spec_action_types_t action_type;
+    EXPECT_TRUE(parse_gobgp_flowspec_action("redirect", action_type));
+    EXPECT_EQ(action_type, bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_REDIRECT);
+    EXPECT_TRUE(parse_gobgp_flowspec_action("discard", action_type));
+    EXPECT_EQ(action_type, bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_DISCARD);
+    EXPECT_FALSE(parse_gobgp_flowspec_action("drop", action_type));
+    EXPECT_FALSE(parse_gobgp_flowspec_action("", action_type));
+}
+
+TEST(gobgp_flowspec_lifecycle, discard_protocol_only_escalation_preserves_action) {
+    uint32_t victim_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", victim_ipv4));
+
+    const auto discard = bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_DISCARD;
+    const attack_details_t udp_attack = make_gobgp_flowspec_port_attack(static_cast<unsigned int>(ip_protocol_t::UDP));
+    const flow_spec_rule_t protocol_only_rule =
+        build_gobgp_flowspec_ipv4_rule(victim_ipv4, udp_attack, 0, std::nullopt, discard);
+    gobgp_flowspec_rule_key_t protocol_only_key;
+    ASSERT_TRUE(build_gobgp_flowspec_rule_key(protocol_only_rule, protocol_only_key));
+
+    gobgp_flowspec_lifecycle_t lifecycle;
+    for (uint16_t port : { 8080, 4431, 53, 123 }) {
+        const flow_spec_rule_t port_rule = build_gobgp_flowspec_ipv4_rule(victim_ipv4, udp_attack, 0, port, discard);
+        gobgp_flowspec_rule_key_t port_key;
+        ASSERT_TRUE(build_gobgp_flowspec_rule_key(port_rule, port_key));
+        ASSERT_TRUE(lifecycle.begin_announce(port_key, port_rule));
+        ASSERT_EQ(lifecycle.complete_announce(port_key, std::string(1, static_cast<char>(port & 0xff))),
+                  gobgp_flowspec_announce_completion_t::installed);
+    }
+
+    const flow_spec_rule_t fifth_port_rule = build_gobgp_flowspec_ipv4_rule(victim_ipv4, udp_attack, 0, 773, discard);
+    gobgp_flowspec_rule_key_t fifth_port_key;
+    ASSERT_TRUE(build_gobgp_flowspec_rule_key(fifth_port_rule, fifth_port_key));
+
+    const auto plan = lifecycle.begin_refresh_protocol_rules(
+        { protocol_only_key, protocol_only_rule }, { { fifth_port_key, fifth_port_rule } }, 4);
+    ASSERT_EQ(plan.action, gobgp_flowspec_refresh_protocol_action_t::escalate_protocol_only);
+    ASSERT_EQ(plan.announce_requests.size(), 1U);
+    EXPECT_EQ(plan.announce_requests.front().flow_spec_rule.get_action().get_type(), discard);
+    EXPECT_TRUE(plan.announce_requests.front().flow_spec_rule.ipv4_nexthops.empty());
+}
+
 TEST(gobgp_flowspec_rule_builder, tcp_protocol) {
     uint32_t victim_ipv4 = 0;
     ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", victim_ipv4));
@@ -889,6 +1011,28 @@ TEST(gobgp_flowspec_notification_formatter, delete_success_report_uses_lifecycle
     EXPECT_EQ(format_gobgp_flowspec_delete_success_notification(flow_spec_rule, std::string("\x01\x02", 2)),
               "FlowSpec DELETE success (GoBGP)\n"
               "Rule: dst=10.10.10.10/32 protocol=ICMP redirect=192.168.100.50\n"
+              "UUID: uuid=hex:0102\n");
+}
+
+TEST(gobgp_flowspec_notification_formatter, discard_reports_exact_rule_action) {
+    uint32_t destination_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", destination_ipv4));
+
+    flow_spec_rule_t flow_spec_rule;
+    flow_spec_rule.set_destination_subnet_ipv4(subnet_cidr_mask_t(destination_ipv4, 32));
+    flow_spec_rule.add_protocol(ip_protocol_t::UDP);
+    flow_spec_rule.add_destination_port(53);
+    bgp_flow_spec_action_t discard_action;
+    discard_action.set_type(bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_DISCARD);
+    flow_spec_rule.set_action(discard_action);
+
+    EXPECT_EQ(format_gobgp_flowspec_add_success_notification(flow_spec_rule, std::string("\x01\x02", 2), std::nullopt),
+              "FlowSpec ADD success (GoBGP)\n"
+              "Rule: dst=10.10.10.10/32 protocol=UDP dst_port=53 action=discard\n"
+              "UUID: uuid=hex:0102\n");
+    EXPECT_EQ(format_gobgp_flowspec_delete_success_notification(flow_spec_rule, std::string("\x01\x02", 2)),
+              "FlowSpec DELETE success (GoBGP)\n"
+              "Rule: dst=10.10.10.10/32 protocol=UDP dst_port=53 action=discard\n"
               "UUID: uuid=hex:0102\n");
 }
 

@@ -287,11 +287,6 @@ std::vector<dynamic_binary_buffer_t> build_attributes_for_flowspec_announce(flow
 
 // Build input attributes for GoBGP Path.pattrs_binary when the FlowSpec NLRI is supplied separately.
 std::vector<dynamic_binary_buffer_t> build_attributes_for_gobgp_flowspec_announce(const flow_spec_rule_t& flow_spec_rule) {
-    if (flow_spec_rule.ipv4_nexthops.size() != 1) {
-        logger << log4cpp::Priority::WARN << "GoBGP FlowSpec IPv4 redirect requires exactly one IPv4 next hop";
-        return std::vector<dynamic_binary_buffer_t>{};
-    }
-
     bgp_attribute_origin origin_attr;
     dynamic_binary_buffer_t origin_as_binary_array;
     origin_as_binary_array.set_buffer_size_in_bytes(sizeof(origin_attr));
@@ -302,6 +297,32 @@ std::vector<dynamic_binary_buffer_t> build_attributes_for_gobgp_flowspec_announc
     dynamic_binary_buffer_t next_hop_carrier_as_binary_array;
     next_hop_carrier_as_binary_array.set_buffer_size_in_bytes(sizeof(next_hop_carrier_attr));
     next_hop_carrier_as_binary_array.append_data_as_object_ptr(&next_hop_carrier_attr);
+
+    const bgp_flow_spec_action_types_t action_type = flow_spec_rule.get_action().get_type();
+    if (action_type == bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_DISCARD) {
+        dynamic_binary_buffer_t discard_extended_community_as_binary_array;
+        if (!encode_bgp_flow_spec_action_as_extended_attribute(flow_spec_rule.get_action(),
+                                                               discard_extended_community_as_binary_array)) {
+            logger << log4cpp::Priority::WARN << "Cannot encode GoBGP FlowSpec discard traffic-rate extended community";
+            return std::vector<dynamic_binary_buffer_t>{};
+        }
+
+        return std::vector<dynamic_binary_buffer_t>{ origin_as_binary_array, next_hop_carrier_as_binary_array,
+                                                     discard_extended_community_as_binary_array };
+    }
+
+    // ACCEPT with an IPv4 next hop is retained for compatibility with existing callers that predate
+    // the explicit FlowSpec redirect action in the GoBGP builder.
+    if (action_type != bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_REDIRECT
+        && action_type != bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_ACCEPT) {
+        logger << log4cpp::Priority::WARN << "GoBGP FlowSpec supports only redirect or discard actions";
+        return std::vector<dynamic_binary_buffer_t>{};
+    }
+
+    if (flow_spec_rule.ipv4_nexthops.size() != 1) {
+        logger << log4cpp::Priority::WARN << "GoBGP FlowSpec IPv4 redirect requires exactly one IPv4 next hop";
+        return std::vector<dynamic_binary_buffer_t>{};
+    }
 
     dynamic_binary_buffer_t redirect_extended_community_as_binary_array;
     if (!encode_bgp_flow_spec_next_hop_as_extended_attribute(flow_spec_rule.ipv4_nexthops[0],
