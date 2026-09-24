@@ -13,7 +13,7 @@ About this fork
 ---------------
 This is an experimental fork of FastNetMon Community Edition. Its primary goal is GoBGP IPv4 FlowSpec mitigation.
 
-Implemented FlowSpec capabilities include IPv4 FlowSpec announcements and withdrawals through GoBGP, redirect-to-IPv4 and native discard actions, protocol-aware rules (TCP, UDP, ICMP, or destination-only), optional dominant destination-port classification for TCP/UDP attacks, and success notifications for FlowSpec changes.
+Implemented FlowSpec capabilities include IPv4 FlowSpec announcements and withdrawals through GoBGP, redirect-to-IPv4, native discard, and RFC 7674 Route Target redirect actions, protocol-aware rules (TCP, UDP, ICMP, or destination-only), optional dominant destination-port classification for TCP/UDP attacks, and success notifications for FlowSpec changes.
 
 This is not an official FastNetMon release and is not endorsed by or affiliated with FastNetMon LTD. The upstream project is [FastNetMon Community Edition](https://github.com/pavel-odintsov/fastnetmon). FastNetMon is a trademark of FastNetMon LTD.
 
@@ -40,8 +40,10 @@ gobgp = on
 gobgp_flowspec = on
 # redirect sends matching traffic to the example scrubber address below.
 # discard removes matching traffic locally on the FlowSpec router.
+# redirect-vrf sends matching traffic to a VRF selected by the Route Target below.
 gobgp_flowspec_action = redirect
 gobgp_flowspec_redirect_ipv4 = 172.66.66.1
+gobgp_flowspec_redirect_rt = 65666:666
 
 gobgp_flowspec_port_detection = on
 gobgp_flowspec_port_min_samples = 10
@@ -53,7 +55,15 @@ gobgp_flowspec_refresh_port_min_share_percent = 20
 gobgp_flowspec_max_port_rules_per_protocol = 4
 ```
 
-`gobgp_flowspec_action` selects the generated FlowSpec action: `redirect` uses an IPv4 redirect-to-IP extended community and requires `gobgp_flowspec_redirect_ipv4`; `discard` advertises a traffic-rate action of zero, removing matched traffic locally on the FlowSpec router and not using a redirect IPv4 address. `172.66.66.1` is only an example redirect IPv4 address; configure the address of the appropriate scrubber or test target for your network. `gobgp_flowspec_port_detection` enables TCP/UDP port analysis, `gobgp_flowspec_port_min_samples` sets the minimum trusted sample count, and `gobgp_flowspec_port_dominance_percent` controls initial dominant-port selection. `gobgp_flowspec_rule_refresh` and its interval enable refresh while a victim remains banned. `gobgp_flowspec_refresh_port_min_share_percent` controls additional refresh ports, while `gobgp_flowspec_max_port_rules_per_protocol` controls escalation to a protocol-only rule.
+`gobgp_flowspec_action` selects the generated FlowSpec action: `redirect` uses an IPv4 redirect-to-IP extended community and requires `gobgp_flowspec_redirect_ipv4`; `discard` advertises a traffic-rate action of zero, removing matched traffic locally on the FlowSpec router and not using either redirect target; `redirect-vrf` advertises an RFC 7674 Route Target redirect and requires `gobgp_flowspec_redirect_rt`. `172.66.66.1` and `65666:666` are examples only; configure values appropriate for your network. `gobgp_flowspec_port_detection` enables TCP/UDP port analysis, `gobgp_flowspec_port_min_samples` sets the minimum trusted sample count, and `gobgp_flowspec_port_dominance_percent` controls initial dominant-port selection. `gobgp_flowspec_rule_refresh` and its interval enable refresh while a victim remains banned. `gobgp_flowspec_refresh_port_min_share_percent` controls additional refresh ports, while `gobgp_flowspec_max_port_rules_per_protocol` controls escalation to a protocol-only rule.
+
+`redirect-vrf` has the following router-side model:
+
+```text
+FastNetMon / GoBGP -- FlowSpec RT Redirect target:65666:666 --> Router --> matching VRF
+```
+
+If the matching VRF has no usable route, matching traffic may become unreachable or be dropped according to router forwarding behavior. If the VRF has a route or default route toward a scrubber, matching traffic is forwarded according to that VRF routing table. Support and forwarding behavior are platform- and software-dependent; verify the feature on the target router before enabling enforcement.
 
 For operational safety, first test FlowSpec against a peer or router policy that accepts and observes generated NLRI without installing a forwarding action. Enable redirect or discard enforcement only after validating the generated rules and router policy.
 

@@ -81,6 +81,7 @@ enum class bgp_flow_spec_action_types_t {
     FLOW_SPEC_ACTION_ACCEPT,
     FLOW_SPEC_ACTION_RATE_LIMIT,
     FLOW_SPEC_ACTION_REDIRECT,
+    FLOW_SPEC_ACTION_REDIRECT_VRF,
     FLOW_SPEC_ACTION_MARK
 };
 
@@ -114,6 +115,14 @@ class bgp_flow_spec_action_t {
         return redirect_value;
     }
 
+    uint32_t get_redirect_rt_as() const {
+        return redirect_rt_as;
+    }
+
+    uint32_t get_redirect_rt_value() const {
+        return redirect_rt_value;
+    }
+
     void set_redirect_as(uint16_t value) {
         redirect_as = value;
     }
@@ -122,12 +131,22 @@ class bgp_flow_spec_action_t {
         redirect_value = value;
     }
 
+    void set_redirect_rt_as(uint32_t value) {
+        redirect_rt_as = value;
+    }
+
+    void set_redirect_rt_value(uint32_t value) {
+        redirect_rt_value = value;
+    }
+
 
     template <class Archive> void serialize(Archive& ar, [[maybe_unused]] const unsigned int version) {
         ar& BOOST_SERIALIZATION_NVP(action_type);
         ar& BOOST_SERIALIZATION_NVP(rate_limit);
         ar& BOOST_SERIALIZATION_NVP(redirect_as);
         ar& BOOST_SERIALIZATION_NVP(redirect_value);
+        ar& BOOST_SERIALIZATION_NVP(redirect_rt_as);
+        ar& BOOST_SERIALIZATION_NVP(redirect_rt_value);
     }
 
     private:
@@ -137,6 +156,10 @@ class bgp_flow_spec_action_t {
     // Values for redirect
     uint16_t redirect_as    = 0;
     uint32_t redirect_value = 0;
+
+    // Values for the RFC 7674 Route Target redirect action
+    uint32_t redirect_rt_as    = 0;
+    uint32_t redirect_rt_value = 0;
 };
 
 bool operator==(const bgp_flow_spec_action_t& lhs, const bgp_flow_spec_action_t& rhs);
@@ -721,6 +744,43 @@ class __attribute__((__packed__)) bgp_extended_community_element_flow_spec_redir
         return buffer.str();
     }
 };
+
+class __attribute__((__packed__)) bgp_extended_community_element_flow_spec_redirect_rt_as_2byte_t {
+    public:
+    uint8_t type_hight = EXTENDED_COMMUNITY_TRANSITIVE_EXPEREMENTAL;
+    uint8_t type_low   = FLOW_SPEC_EXTENDED_COMMUNITY_SUBTYPE_REDIRECT_AS_TWO_BYTE;
+    uint16_t route_target_as    = 0;
+    uint32_t route_target_value = 0;
+
+    void set_route_target_as(uint16_t value) {
+        route_target_as = fast_hton(value);
+    }
+
+    void set_route_target_value(uint32_t value) {
+        route_target_value = fast_hton(value);
+    }
+};
+
+class __attribute__((__packed__)) bgp_extended_community_element_flow_spec_redirect_rt_as_4byte_t {
+    public:
+    uint8_t type_hight = EXTENDED_COMMUNITY_TRANSITIVE_EXPEREMENTAL_PART_3;
+    uint8_t type_low   = FLOW_SPEC_EXTENDED_COMMUNITY_SUBTYPE_REDIRECT_AS_TWO_BYTE;
+    uint32_t route_target_as    = 0;
+    uint16_t route_target_value = 0;
+
+    void set_route_target_as(uint32_t value) {
+        route_target_as = fast_hton(value);
+    }
+
+    void set_route_target_value(uint16_t value) {
+        route_target_value = fast_hton(value);
+    }
+};
+
+static_assert(sizeof(bgp_extended_community_element_flow_spec_redirect_rt_as_2byte_t) == 8,
+              "Bad size for bgp_extended_community_element_flow_spec_redirect_rt_as_2byte_t");
+static_assert(sizeof(bgp_extended_community_element_flow_spec_redirect_rt_as_4byte_t) == 8,
+              "Bad size for bgp_extended_community_element_flow_spec_redirect_rt_as_4byte_t");
 
 static_assert(sizeof(bgp_extended_community_element_flow_spec_redirect_2_octet_as_4_octet_value_t_t) == 8,
               "Bad size for bgp_extended_community_element_flow_spec_redirect_2_octet_as_4_octet_value_t_t");

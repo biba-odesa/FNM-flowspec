@@ -285,6 +285,45 @@ std::vector<dynamic_binary_buffer_t> build_attributes_for_flowspec_announce(flow
                                                  extended_attributes_as_binary_array };
 }
 
+namespace {
+
+bool encode_bgp_flow_spec_redirect_rt_as_extended_attribute(const bgp_flow_spec_action_t& bgp_flow_spec_action,
+                                                            dynamic_binary_buffer_t& extended_attributes_as_binary_array) {
+    bgp_extended_community_attribute_t extended_community_attribute;
+    extended_community_attribute.attribute_length = sizeof(bgp_extended_community_element_t);
+
+    const uint32_t route_target_as    = bgp_flow_spec_action.get_redirect_rt_as();
+    const uint32_t route_target_value = bgp_flow_spec_action.get_redirect_rt_value();
+
+    if (route_target_as <= UINT16_MAX) {
+        bgp_extended_community_element_flow_spec_redirect_rt_as_2byte_t redirect_rt;
+        redirect_rt.set_route_target_as(static_cast<uint16_t>(route_target_as));
+        redirect_rt.set_route_target_value(route_target_value);
+
+        extended_attributes_as_binary_array.set_buffer_size_in_bytes(sizeof(extended_community_attribute) + sizeof(redirect_rt));
+        extended_attributes_as_binary_array.append_data_as_object_ptr(&extended_community_attribute);
+        extended_attributes_as_binary_array.append_data_as_object_ptr(&redirect_rt);
+        return true;
+    }
+
+    if (route_target_value > UINT16_MAX) {
+        logger << log4cpp::Priority::WARN
+               << "RFC 7674 AS-4byte Route Target redirect requires a value no greater than 65535";
+        return false;
+    }
+
+    bgp_extended_community_element_flow_spec_redirect_rt_as_4byte_t redirect_rt;
+    redirect_rt.set_route_target_as(route_target_as);
+    redirect_rt.set_route_target_value(static_cast<uint16_t>(route_target_value));
+
+    extended_attributes_as_binary_array.set_buffer_size_in_bytes(sizeof(extended_community_attribute) + sizeof(redirect_rt));
+    extended_attributes_as_binary_array.append_data_as_object_ptr(&extended_community_attribute);
+    extended_attributes_as_binary_array.append_data_as_object_ptr(&redirect_rt);
+    return true;
+}
+
+} // namespace
+
 // Build input attributes for GoBGP Path.pattrs_binary when the FlowSpec NLRI is supplied separately.
 std::vector<dynamic_binary_buffer_t> build_attributes_for_gobgp_flowspec_announce(const flow_spec_rule_t& flow_spec_rule) {
     bgp_attribute_origin origin_attr;
@@ -311,11 +350,23 @@ std::vector<dynamic_binary_buffer_t> build_attributes_for_gobgp_flowspec_announc
                                                      discard_extended_community_as_binary_array };
     }
 
+    if (action_type == bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_REDIRECT_VRF) {
+        dynamic_binary_buffer_t redirect_rt_extended_community_as_binary_array;
+        if (!encode_bgp_flow_spec_redirect_rt_as_extended_attribute(flow_spec_rule.get_action(),
+                                                                      redirect_rt_extended_community_as_binary_array)) {
+            logger << log4cpp::Priority::WARN << "Cannot encode GoBGP FlowSpec RFC 7674 Route Target redirect extended community";
+            return std::vector<dynamic_binary_buffer_t>{};
+        }
+
+        return std::vector<dynamic_binary_buffer_t>{ origin_as_binary_array, next_hop_carrier_as_binary_array,
+                                                     redirect_rt_extended_community_as_binary_array };
+    }
+
     // ACCEPT with an IPv4 next hop is retained for compatibility with existing callers that predate
     // the explicit FlowSpec redirect action in the GoBGP builder.
     if (action_type != bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_REDIRECT
         && action_type != bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_ACCEPT) {
-        logger << log4cpp::Priority::WARN << "GoBGP FlowSpec supports only redirect or discard actions";
+        logger << log4cpp::Priority::WARN << "GoBGP FlowSpec supports only redirect, discard, or redirect-vrf actions";
         return std::vector<dynamic_binary_buffer_t>{};
     }
 
@@ -666,8 +717,11 @@ bool encode_bgp_flow_spec_action_as_extended_attribute(const bgp_flow_spec_actio
         extended_attributes_as_binary_array.append_data_as_object_ptr(&bgp_extended_community_attribute);
         extended_attributes_as_binary_array.append_data_as_object_ptr(
             &bgp_extended_community_element_flow_spec_redirect_2_octet_as_4_octet_value);
+    } else if (bgp_flow_spec_action.get_type() == bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_REDIRECT_VRF) {
+        return encode_bgp_flow_spec_redirect_rt_as_extended_attribute(bgp_flow_spec_action,
+                                                                        extended_attributes_as_binary_array);
     } else {
-        logger << log4cpp::Priority::WARN << "We support only discard, rate limit, redirect actions";
+        logger << log4cpp::Priority::WARN << "We support only discard, rate limit, redirect, redirect-vrf actions";
         return false;
     }
 
@@ -1187,6 +1241,8 @@ bool read_flow_spec_action_type_from_string(const std::string& string_form, bgp_
         action_type = bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_RATE_LIMIT;
     } else if (string_form == "redirect") {
         action_type = bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_REDIRECT;
+    } else if (string_form == "redirect-vrf") {
+        action_type = bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_REDIRECT_VRF;
     } else if (string_form == "mark") {
         action_type = bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_MARK;
     } else {
@@ -1205,6 +1261,8 @@ std::string serialize_action_type(const bgp_flow_spec_action_types_t& action_typ
         return "rate-limit";
     } else if (action_type == bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_REDIRECT) {
         return "redirect";
+    } else if (action_type == bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_REDIRECT_VRF) {
+        return "redirect-vrf";
     } else if (action_type == bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_MARK) {
         return "mark";
     } else {
@@ -1281,6 +1339,9 @@ bool operator==(const bgp_flow_spec_action_t& lhs, const bgp_flow_spec_action_t&
     // Action types are equal
     if (lhs.get_type() == bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_RATE_LIMIT) {
         return lhs.get_rate_limit() == rhs.get_rate_limit();
+    } else if (lhs.get_type() == bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_REDIRECT_VRF) {
+        return lhs.get_redirect_rt_as() == rhs.get_redirect_rt_as()
+               && lhs.get_redirect_rt_value() == rhs.get_redirect_rt_value();
     } else {
         return true;
     }

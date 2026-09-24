@@ -653,6 +653,84 @@ TEST(gobgp_flowspec_rule_builder, validates_configured_action_names) {
     EXPECT_FALSE(parse_gobgp_flowspec_action("", action_type));
 }
 
+TEST(gobgp_flowspec_rule_builder, validates_redirect_vrf_action_name) {
+    bgp_flow_spec_action_types_t action_type;
+    EXPECT_TRUE(parse_gobgp_flowspec_action("redirect-vrf", action_type));
+    EXPECT_EQ(action_type, bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_REDIRECT_VRF);
+}
+
+TEST(gobgp_flowspec_rule_builder, parses_rfc7674_route_targets) {
+    uint32_t asn = 0;
+    uint32_t value = 0;
+
+    EXPECT_TRUE(parse_gobgp_flowspec_redirect_rt("65666:666", asn, value));
+    EXPECT_EQ(asn, 65666U);
+    EXPECT_EQ(value, 666U);
+    EXPECT_TRUE(parse_gobgp_flowspec_redirect_rt("0:0", asn, value));
+    EXPECT_EQ(asn, 0U);
+    EXPECT_EQ(value, 0U);
+    EXPECT_TRUE(parse_gobgp_flowspec_redirect_rt("65535:4294967295", asn, value));
+    EXPECT_EQ(asn, 65535U);
+    EXPECT_EQ(value, UINT32_MAX);
+}
+
+TEST(gobgp_flowspec_rule_builder, rejects_malformed_rfc7674_route_targets) {
+    uint32_t asn = 0;
+    uint32_t value = 0;
+
+    for (const std::string& route_target : { "65536:4294967295", "65666:4294967296", "-1:1", "1:-1",
+                                             "abc:1", "1:abc", "1", "1:", ":1", "1:2:3", " 1:2",
+                                             "1:2 ", "1:2x" }) {
+        EXPECT_FALSE(parse_gobgp_flowspec_redirect_rt(route_target, asn, value)) << route_target;
+    }
+}
+
+TEST(flowspec, gobgp_static_redirect_vrf_rfc7674_wire_encoding) {
+    uint32_t destination_ip = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", destination_ip));
+
+    attack_details_t current_attack = make_gobgp_flowspec_port_attack(static_cast<unsigned int>(ip_protocol_t::UDP));
+    const flow_spec_rule_t flow_spec_rule = build_gobgp_flowspec_ipv4_rule(
+        destination_ip, current_attack, 0, 53, bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_REDIRECT_VRF, 65666, 666);
+
+    EXPECT_TRUE(flow_spec_rule.ipv4_nexthops.empty());
+    EXPECT_EQ(flow_spec_rule.get_action().get_type(), bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_REDIRECT_VRF);
+    EXPECT_EQ(flow_spec_rule.get_action().get_redirect_rt_as(), 65666U);
+    EXPECT_EQ(flow_spec_rule.get_action().get_redirect_rt_value(), 666U);
+
+    const std::vector<dynamic_binary_buffer_t> attributes = build_attributes_for_gobgp_flowspec_announce(flow_spec_rule);
+    ASSERT_EQ(attributes.size(), 3U);
+    const std::array<uint8_t, 11> expected_redirect_rt_extended_community = {
+        0xc0, 0x10, 0x08, 0x82, 0x08, 0x00, 0x01, 0x00, 0x82, 0x02, 0x9a
+    };
+    ASSERT_EQ(attributes[2].get_used_size(), expected_redirect_rt_extended_community.size());
+    EXPECT_EQ(memcmp(attributes[2].get_pointer(), expected_redirect_rt_extended_community.data(),
+                     expected_redirect_rt_extended_community.size()),
+              0);
+}
+
+TEST(gobgp_flowspec_rule_builder, redirect_vrf_rules_apply_to_tcp_udp_and_icmp) {
+    uint32_t victim_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", victim_ipv4));
+
+    const auto redirect_vrf = bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_REDIRECT_VRF;
+    const attack_details_t tcp_attack = make_gobgp_flowspec_port_attack(static_cast<unsigned int>(ip_protocol_t::TCP));
+    const attack_details_t udp_attack = make_gobgp_flowspec_port_attack(static_cast<unsigned int>(ip_protocol_t::UDP));
+    const attack_details_t icmp_attack = make_gobgp_flowspec_port_attack(static_cast<unsigned int>(ip_protocol_t::ICMP));
+    const flow_spec_rule_t tcp_rule = build_gobgp_flowspec_ipv4_rule(victim_ipv4, tcp_attack, 0, 443, redirect_vrf, 65666, 666);
+    const flow_spec_rule_t udp_rule = build_gobgp_flowspec_ipv4_rule(victim_ipv4, udp_attack, 0, 53, redirect_vrf, 65666, 666);
+    const flow_spec_rule_t icmp_rule = build_gobgp_flowspec_ipv4_rule(victim_ipv4, icmp_attack, 0, std::nullopt, redirect_vrf, 65666, 666);
+
+    EXPECT_EQ(tcp_rule.destination_ports, std::vector<uint16_t>{ 443 });
+    EXPECT_EQ(udp_rule.destination_ports, std::vector<uint16_t>{ 53 });
+    EXPECT_TRUE(icmp_rule.destination_ports.empty());
+    for (const flow_spec_rule_t* rule : { &tcp_rule, &udp_rule, &icmp_rule }) {
+        EXPECT_EQ(rule->get_action().get_type(), redirect_vrf);
+        EXPECT_TRUE(rule->ipv4_nexthops.empty());
+        EXPECT_NE(format_gobgp_flowspec_rule(*rule).find("redirect_rt=65666:666"), std::string::npos);
+    }
+}
+
 TEST(gobgp_flowspec_lifecycle, discard_protocol_only_escalation_preserves_action) {
     uint32_t victim_ipv4 = 0;
     ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", victim_ipv4));
@@ -684,6 +762,42 @@ TEST(gobgp_flowspec_lifecycle, discard_protocol_only_escalation_preserves_action
     ASSERT_EQ(plan.announce_requests.size(), 1U);
     EXPECT_EQ(plan.announce_requests.front().flow_spec_rule.get_action().get_type(), discard);
     EXPECT_TRUE(plan.announce_requests.front().flow_spec_rule.ipv4_nexthops.empty());
+}
+
+TEST(gobgp_flowspec_lifecycle, redirect_vrf_protocol_only_escalation_preserves_action) {
+    uint32_t victim_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", victim_ipv4));
+
+    const auto redirect_vrf = bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_REDIRECT_VRF;
+    const attack_details_t udp_attack = make_gobgp_flowspec_port_attack(static_cast<unsigned int>(ip_protocol_t::UDP));
+    const flow_spec_rule_t protocol_only_rule =
+        build_gobgp_flowspec_ipv4_rule(victim_ipv4, udp_attack, 0, std::nullopt, redirect_vrf, 65666, 666);
+    gobgp_flowspec_rule_key_t protocol_only_key;
+    ASSERT_TRUE(build_gobgp_flowspec_rule_key(protocol_only_rule, protocol_only_key));
+
+    gobgp_flowspec_lifecycle_t lifecycle;
+    for (uint16_t port : { 8080, 4431, 53, 123 }) {
+        const flow_spec_rule_t port_rule =
+            build_gobgp_flowspec_ipv4_rule(victim_ipv4, udp_attack, 0, port, redirect_vrf, 65666, 666);
+        gobgp_flowspec_rule_key_t port_key;
+        ASSERT_TRUE(build_gobgp_flowspec_rule_key(port_rule, port_key));
+        ASSERT_TRUE(lifecycle.begin_announce(port_key, port_rule));
+        ASSERT_EQ(lifecycle.complete_announce(port_key, std::string(1, static_cast<char>(port & 0xff))),
+                  gobgp_flowspec_announce_completion_t::installed);
+    }
+
+    const flow_spec_rule_t fifth_port_rule =
+        build_gobgp_flowspec_ipv4_rule(victim_ipv4, udp_attack, 0, 773, redirect_vrf, 65666, 666);
+    gobgp_flowspec_rule_key_t fifth_port_key;
+    ASSERT_TRUE(build_gobgp_flowspec_rule_key(fifth_port_rule, fifth_port_key));
+
+    const auto plan = lifecycle.begin_refresh_protocol_rules(
+        { protocol_only_key, protocol_only_rule }, { { fifth_port_key, fifth_port_rule } }, 4);
+    ASSERT_EQ(plan.action, gobgp_flowspec_refresh_protocol_action_t::escalate_protocol_only);
+    ASSERT_EQ(plan.announce_requests.size(), 1U);
+    EXPECT_EQ(plan.announce_requests.front().flow_spec_rule.get_action().get_type(), redirect_vrf);
+    EXPECT_EQ(plan.announce_requests.front().flow_spec_rule.get_action().get_redirect_rt_as(), 65666U);
+    EXPECT_EQ(plan.announce_requests.front().flow_spec_rule.get_action().get_redirect_rt_value(), 666U);
 }
 
 TEST(gobgp_flowspec_rule_builder, tcp_protocol) {
@@ -1033,6 +1147,30 @@ TEST(gobgp_flowspec_notification_formatter, discard_reports_exact_rule_action) {
     EXPECT_EQ(format_gobgp_flowspec_delete_success_notification(flow_spec_rule, std::string("\x01\x02", 2)),
               "FlowSpec DELETE success (GoBGP)\n"
               "Rule: dst=10.10.10.10/32 protocol=UDP dst_port=53 action=discard\n"
+              "UUID: uuid=hex:0102\n");
+}
+
+TEST(gobgp_flowspec_notification_formatter, redirect_vrf_reports_exact_route_target) {
+    uint32_t destination_ipv4 = 0;
+    ASSERT_TRUE(convert_ip_as_string_to_uint_safe("10.10.10.10", destination_ipv4));
+
+    flow_spec_rule_t flow_spec_rule;
+    flow_spec_rule.set_destination_subnet_ipv4(subnet_cidr_mask_t(destination_ipv4, 32));
+    flow_spec_rule.add_protocol(ip_protocol_t::UDP);
+    flow_spec_rule.add_destination_port(53);
+    bgp_flow_spec_action_t redirect_vrf_action;
+    redirect_vrf_action.set_type(bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_REDIRECT_VRF);
+    redirect_vrf_action.set_redirect_rt_as(65666);
+    redirect_vrf_action.set_redirect_rt_value(666);
+    flow_spec_rule.set_action(redirect_vrf_action);
+
+    EXPECT_EQ(format_gobgp_flowspec_add_success_notification(flow_spec_rule, std::string("\x01\x02", 2), std::nullopt),
+              "FlowSpec ADD success (GoBGP)\n"
+              "Rule: dst=10.10.10.10/32 protocol=UDP dst_port=53 redirect_rt=65666:666\n"
+              "UUID: uuid=hex:0102\n");
+    EXPECT_EQ(format_gobgp_flowspec_delete_success_notification(flow_spec_rule, std::string("\x01\x02", 2)),
+              "FlowSpec DELETE success (GoBGP)\n"
+              "Rule: dst=10.10.10.10/32 protocol=UDP dst_port=53 redirect_rt=65666:666\n"
               "UUID: uuid=hex:0102\n");
 }
 

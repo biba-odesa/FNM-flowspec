@@ -215,6 +215,9 @@ enum EXTENDED_COMMUNITY_TYPES_HIGHT_UNTYPED : uint8_t {
     // We are encoding attributes for BGP flow spec this way
     // Generic Transitive Experimental Use Extended Community
     EXTENDED_COMMUNITY_TRANSITIVE_EXPEREMENTAL = 128, // 0x80
+
+    // Generic Transitive Experimental Use Extended Community Part 3
+    EXTENDED_COMMUNITY_TRANSITIVE_EXPEREMENTAL_PART_3 = 130, // 0x82
 };
 
 // Subtypes for EXTENDED_COMMUNITY_TRANSITIVE_EXPEREMENTAL

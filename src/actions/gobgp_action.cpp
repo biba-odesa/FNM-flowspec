@@ -55,7 +55,7 @@ bool get_configured_gobgp_flowspec_action(bgp_flow_spec_action_types_t& action_t
         return true;
     }
 
-    logger << log4cpp::Priority::ERROR << "Configuration error: gobgp_flowspec_action must be redirect or discard";
+    logger << log4cpp::Priority::ERROR << "Configuration error: gobgp_flowspec_action must be redirect, discard, or redirect-vrf";
     return false;
 }
 
@@ -63,6 +63,16 @@ bool get_configured_gobgp_flowspec_redirect_ipv4(uint32_t& redirect_ipv4) {
     if (!convert_ip_as_string_to_uint_safe(fastnetmon_global_configuration.gobgp_flowspec_redirect_ipv4, redirect_ipv4)
         || redirect_ipv4 == 0) {
         logger << log4cpp::Priority::ERROR << "GoBGP FlowSpec ADD failed because configured redirect IPv4 is invalid";
+        return false;
+    }
+
+    return true;
+}
+
+bool get_configured_gobgp_flowspec_redirect_rt(uint32_t& redirect_rt_as, uint32_t& redirect_rt_value) {
+    if (!parse_gobgp_flowspec_redirect_rt(fastnetmon_global_configuration.gobgp_flowspec_redirect_rt,
+                                          redirect_rt_as, redirect_rt_value)) {
+        logger << log4cpp::Priority::ERROR << "GoBGP FlowSpec ADD failed because configured Route Target redirect is invalid";
         return false;
     }
 
@@ -233,8 +243,16 @@ void gobgp_ban_manage_flowspec_ipv4(GrpcClient& gobgp_client,
         return;
     }
 
+    uint32_t redirect_rt_as = 0;
+    uint32_t redirect_rt_value = 0;
+    if (flow_spec_action == bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_REDIRECT_VRF
+        && !get_configured_gobgp_flowspec_redirect_rt(redirect_rt_as, redirect_rt_value)) {
+        return;
+    }
+
     flow_spec_rule_t flow_spec_rule =
-        build_gobgp_flowspec_ipv4_rule(client_ip, current_attack, redirect_ipv4, selected_destination_port, flow_spec_action);
+        build_gobgp_flowspec_ipv4_rule(client_ip, current_attack, redirect_ipv4, selected_destination_port, flow_spec_action,
+                                       redirect_rt_as, redirect_rt_value);
     gobgp_flowspec_rule_key_t rule_key;
 
     if (!build_gobgp_flowspec_rule_key(flow_spec_rule, rule_key)) {
@@ -313,6 +331,10 @@ void gobgp_action_init() {
         fastnetmon_global_configuration.gobgp_flowspec_action = configuration_map["gobgp_flowspec_action"];
     }
 
+    if (configuration_map.count("gobgp_flowspec_redirect_rt")) {
+        fastnetmon_global_configuration.gobgp_flowspec_redirect_rt = configuration_map["gobgp_flowspec_redirect_rt"];
+    }
+
     if (configuration_map.count("gobgp_flowspec_notify_script_path")) {
         fastnetmon_global_configuration.gobgp_flowspec_notify_script_path =
             configuration_map["gobgp_flowspec_notify_script_path"];
@@ -341,6 +363,16 @@ void gobgp_action_init() {
                 logger << log4cpp::Priority::ERROR
                        << "Configuration error: gobgp_flowspec=on with gobgp_flowspec_action=redirect requires a non-zero valid IPv4 "
                           "gobgp_flowspec_redirect_ipv4";
+                exit(1);
+            }
+        } else if (flow_spec_action == bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_REDIRECT_VRF) {
+            uint32_t redirect_rt_as = 0;
+            uint32_t redirect_rt_value = 0;
+            if (!parse_gobgp_flowspec_redirect_rt(fastnetmon_global_configuration.gobgp_flowspec_redirect_rt,
+                                                  redirect_rt_as, redirect_rt_value)) {
+                logger << log4cpp::Priority::ERROR
+                       << "Configuration error: gobgp_flowspec=on with gobgp_flowspec_action=redirect-vrf requires a valid "
+                          "gobgp_flowspec_redirect_rt Route Target";
                 exit(1);
             }
         }
@@ -708,6 +740,14 @@ void gobgp_flowspec_refresh_manage_ipv4(
             return;
         }
 
+        uint32_t redirect_rt_as = 0;
+        uint32_t redirect_rt_value = 0;
+        if (flow_spec_action == bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_REDIRECT_VRF
+            && !get_configured_gobgp_flowspec_redirect_rt(redirect_rt_as, redirect_rt_value)) {
+            gobgp_flowspec_lifecycle.finish_refresh_capture(client_ip);
+            return;
+        }
+
         GrpcClient gobgp_client = GrpcClient(grpc::CreateChannel("localhost:50051", grpc::InsecureChannelCredentials()));
 
         for (const auto& protocol_result : protocol_results) {
@@ -716,7 +756,8 @@ void gobgp_flowspec_refresh_manage_ipv4(
             current_attack.attack_protocol = static_cast<unsigned int>(protocol_result.protocol);
 
             flow_spec_rule_t protocol_only_rule =
-                build_gobgp_flowspec_ipv4_rule(client_ip, current_attack, redirect_ipv4, std::nullopt, flow_spec_action);
+                build_gobgp_flowspec_ipv4_rule(client_ip, current_attack, redirect_ipv4, std::nullopt, flow_spec_action,
+                                               redirect_rt_as, redirect_rt_value);
             gobgp_flowspec_rule_key_t protocol_only_key;
 
             if (!build_gobgp_flowspec_rule_key(protocol_only_rule, protocol_only_key)) {
@@ -739,7 +780,8 @@ void gobgp_flowspec_refresh_manage_ipv4(
             std::vector<gobgp_flowspec_announce_request_t> port_rule_requests;
             for (const auto& candidate : protocol_result.significant_ports) {
                 flow_spec_rule_t port_rule = build_gobgp_flowspec_ipv4_rule(
-                    client_ip, current_attack, redirect_ipv4, candidate.destination_port, flow_spec_action);
+                    client_ip, current_attack, redirect_ipv4, candidate.destination_port, flow_spec_action,
+                    redirect_rt_as, redirect_rt_value);
                 gobgp_flowspec_rule_key_t port_rule_key;
 
                 if (!build_gobgp_flowspec_rule_key(port_rule, port_rule_key)) {

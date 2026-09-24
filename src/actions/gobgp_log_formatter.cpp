@@ -79,6 +79,9 @@ std::string format_gobgp_flowspec_rule(const flow_spec_rule_t& flow_spec_rule) {
 
     if (flow_spec_rule.get_action().get_type() == bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_DISCARD) {
         buffer << " action=discard";
+    } else if (flow_spec_rule.get_action().get_type() == bgp_flow_spec_action_types_t::FLOW_SPEC_ACTION_REDIRECT_VRF) {
+        buffer << " redirect_rt=" << flow_spec_rule.get_action().get_redirect_rt_as() << ":"
+               << flow_spec_rule.get_action().get_redirect_rt_value();
     } else {
         buffer << " redirect=";
         if (flow_spec_rule.ipv4_nexthops.empty()) {
